@@ -51,7 +51,7 @@ def get_config():
         
         # Preferencias de reserva
         "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["14:00", "10:00", "11:00"],  # En orden de prioridad
+        "horarios_preferidos": ["10:00", "11:00"],  # En orden de prioridad
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
@@ -140,24 +140,44 @@ def ir_a_padel_diurno(page, config):
     # Ir a favoritos/clubes
     page.goto(config["url_favoritos"], timeout=config["timeout_navegacion"])
     page.wait_for_load_state("networkidle")
-    time.sleep(2)
+    time.sleep(3)
     
     # Click en CLUBES si es necesario
     try:
         page.click('text="CLUBES"', timeout=3000)
         time.sleep(2)
+        page.wait_for_load_state("networkidle")
     except:
         pass
     
     # Buscar y clickear en PÁDEL DIURNO
+    # El elemento es un <h4>CISSAB | PÁDEL DIURNO</h4> dentro de un div clickeable
     try:
-        page.click(f'text="{config["actividad"]}"', timeout=5000)
-        time.sleep(2)
-        page.wait_for_load_state("networkidle")
-        print("✅ En sección PÁDEL DIURNO")
-        return True
-    except PlaywrightTimeout:
+        # Intentar click en el contenedor o en el h4
+        selectores = [
+            'h4:has-text("PÁDEL DIURNO")',
+            'div[id*="club_id"]:has-text("PÁDEL DIURNO")',
+            'div.open_calendar_board:has-text("PÁDEL DIURNO")',
+            'text="CISSAB | PÁDEL DIURNO"',
+        ]
+        
+        for selector in selectores:
+            try:
+                elemento = page.locator(selector).first
+                if elemento.is_visible():
+                    elemento.click()
+                    time.sleep(2)
+                    page.wait_for_load_state("networkidle")
+                    print("✅ En sección PÁDEL DIURNO")
+                    return True
+            except:
+                continue
+        
         print("❌ No se encontró PÁDEL DIURNO")
+        return False
+        
+    except Exception as e:
+        print(f"❌ Error navegando: {e}")
         return False
 
 
