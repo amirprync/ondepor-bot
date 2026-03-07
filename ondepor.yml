@@ -1,0 +1,48 @@
+name: OnDepor - Reserva Pádel
+
+on:
+  # Ejecutar automáticamente para reservar:
+  # - Sábado 10:00 → Viernes 10:00 (13:00 UTC)
+  # - Domingo 10:00 → Sábado 10:00 (13:00 UTC)
+  schedule:
+    # Viernes 10:00 Argentina (13:00 UTC) - para reservar Sábado
+    - cron: '0 13 * * 5'
+    # Sábado 10:00 Argentina (13:00 UTC) - para reservar Domingo
+    - cron: '0 13 * * 6'
+  
+  # También permitir ejecución manual
+  workflow_dispatch:
+
+jobs:
+  reservar-cancha:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Instalar dependencias
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps
+      
+      - name: Ejecutar bot de reserva
+        env:
+          ONDEPOR_USER: ${{ secrets.ONDEPOR_USER }}
+          ONDEPOR_PASS: ${{ secrets.ONDEPOR_PASS }}
+        run: python ondepor_bot.py
+      
+      - name: Notificar resultado
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Reserva de pádel completada exitosamente"
+          else
+            echo "❌ Hubo un error en la reserva"
+          fi
