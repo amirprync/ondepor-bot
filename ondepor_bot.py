@@ -51,7 +51,7 @@ def get_config():
         
         # Preferencias de reserva
         "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["10:00", "11:00"],  # En orden de prioridad
+        "horarios_preferidos": ["14:00", "10:00", "11:00"],  # En orden de prioridad
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
@@ -88,26 +88,29 @@ def login(page, config):
     try:
         page.click('text="INICIAR SESIÓN"', timeout=5000)
         time.sleep(2)
+        page.wait_for_load_state("networkidle")
     except:
-        # Puede que ya esté en la página de login
-        page.goto(config["url_login"])
-        time.sleep(2)
+        pass
     
-    # Esperar el modal/formulario de login
-    page.wait_for_load_state("networkidle")
+    # Esperar a que aparezca el formulario de login
+    try:
+        page.wait_for_selector('#loginform-email', timeout=10000)
+    except:
+        print("   ❌ No se encontró el formulario de login")
+        return False
     
-    # Completar credenciales
+    # Completar credenciales con los IDs correctos
     try:
         # Campo email
-        page.fill('input[placeholder*="email" i], input[type="email"], input[name="LoginForm[username]"]', config["usuario"])
+        page.fill('#loginform-email', config["usuario"])
         time.sleep(0.5)
         
         # Campo contraseña
-        page.fill('input[type="password"]', config["password"])
+        page.fill('#loginform-password', config["password"])
         time.sleep(0.5)
         
         # Click en INGRESAR
-        page.click('button:has-text("INGRESAR"), input[type="submit"]:has-text("INGRESAR")')
+        page.click('#login')
         
     except Exception as e:
         print(f"   ⚠️ Error en formulario: {e}")
