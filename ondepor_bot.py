@@ -42,6 +42,19 @@ def get_config():
         print("   Configurar ONDEPOR_USER y ONDEPOR_PASS")
         sys.exit(1)
     
+    # Los socios se pueden configurar desde variable de entorno
+    # Formato: "Alan Garbo,Gabriel Topor,Damian Potap"
+    socios_env = os.environ.get("ONDEPOR_SOCIOS", "")
+    if socios_env:
+        socios = [s.strip() for s in socios_env.split(",")]
+    else:
+        # Socios por defecto
+        socios = [
+            "Alan Garbo",
+            "Gabriel Topor",
+            "Damian Potap"
+        ]
+    
     return {
         "url": "https://www.ondepor.com/",
         "url_login": "https://www.ondepor.com/site/login",
@@ -51,18 +64,14 @@ def get_config():
         
         # Preferencias de reserva
         "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["14:00", "10:00", "11:00"],  # En orden de prioridad
+        "horarios_preferidos": ["10:00", "11:00"],  # En orden de prioridad
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
         "canchas_preferidas": ["KINERET", "05-", "06-", "07-", "08-"],
         
-        # Socios a agregar
-        "socios": [
-            "Alan Garbo",
-            "Gabriel Topor",
-            "Damian Potap"
-        ],
+        # Socios a agregar (configurable via ONDEPOR_SOCIOS)
+        "socios": socios,
         
         # Timeouts
         "timeout_navegacion": 30000,
@@ -367,6 +376,32 @@ def aceptar_terminos(page):
         return False
 
 
+def verificar_errores(page):
+    """Verifica si hay mensajes de error en el modal."""
+    print("   🔍 Verificando errores...")
+    
+    # Buscar mensajes de error (el div naranja/rojo con errores)
+    errores = page.locator('.alert-danger, .alert-warning, [class*="error"], [style*="background"][style*="rgb(23"]').all()
+    
+    for error in errores:
+        try:
+            if error.is_visible():
+                texto = error.inner_text()
+                if texto and len(texto) > 5:
+                    print(f"   ⚠️ ERROR DETECTADO: {texto[:100]}")
+                    return False
+        except:
+            continue
+    
+    # También verificar el mensaje específico de "máximo de reservas"
+    if page.locator('text=/máximo de reservas/i').count() > 0:
+        print("   ⚠️ ERROR: Uno de los socios tiene el máximo de reservas permitidas")
+        return False
+    
+    print("   ✅ Sin errores detectados")
+    return True
+
+
 def confirmar_reserva(page, dry_run=False):
     """Hace click en el botón Reservar."""
     print("   💾 Confirmando reserva...")
@@ -375,16 +410,36 @@ def confirmar_reserva(page, dry_run=False):
         print("   [DRY RUN] Simulando click en RESERVAR")
         return True
     
+    # Verificar si hay errores antes de confirmar
+    if not verificar_errores(page):
+        print("   ❌ No se puede confirmar, hay errores en el formulario")
+        return False
+    
     try:
         page.click('#btn_submit', timeout=5000)
         time.sleep(3)
         page.wait_for_load_state("networkidle")
         
-        # Verificar si hubo éxito (buscar mensaje de confirmación o que el modal se cierre)
+        # Esperar el mensaje de confirmación
         time.sleep(2)
         
-        print("   ✅ Reserva confirmada")
-        return True
+        # Verificar si apareció el mensaje de éxito
+        if page.locator('text=/reserva fue realizada/i').count() > 0:
+            print("   ✅ Reserva confirmada exitosamente")
+            # Click en CERRAR si aparece
+            try:
+                page.click('text="CERRAR"', timeout=3000)
+            except:
+                pass
+            return True
+        else:
+            # Verificar si hay error
+            if page.locator('text=/máximo de reservas/i').count() > 0:
+                print("   ❌ Error: máximo de reservas alcanzado")
+                return False
+            print("   ⚠️ No se pudo verificar la confirmación")
+            return False
+            
     except Exception as e:
         print(f"   ⚠️ Error al confirmar: {e}")
         return False
