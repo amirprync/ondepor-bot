@@ -36,6 +36,7 @@ jobs:
         env:
           ONDEPOR_USER: ${{ secrets.ONDEPOR_USER }}
           ONDEPOR_PASS: ${{ secrets.ONDEPOR_PASS }}
+          ONDEPOR_SOCIOS: ${{ secrets.ONDEPOR_SOCIOS }}
         run: python ondepor_bot.py
       
       - name: Notificar resultado
