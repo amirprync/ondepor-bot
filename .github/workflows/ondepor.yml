@@ -2,13 +2,16 @@ name: OnDepor - Reserva Pádel
 
 on:
   # Ejecutar automáticamente para reservar:
-  # - Sábado 10:00 → Viernes 10:00 (13:00 UTC)
-  # - Domingo 10:00 → Sábado 10:00 (13:00 UTC)
+  # El sistema habilita a las XX:01, así que arrancamos a las XX:55 (5 min antes)
+  # para tener margen y estar listos esperando
+  # 
+  # Sábado 10:00 → Viernes 9:55 (12:55 UTC)
+  # Domingo 10:00 → Sábado 9:55 (12:55 UTC)
   schedule:
-    # Viernes 10:00 Argentina (13:00 UTC) - para reservar Sábado
-    - cron: '0 13 * * 5'
-    # Sábado 10:00 Argentina (13:00 UTC) - para reservar Domingo
-    - cron: '0 13 * * 6'
+    # Viernes 9:55 Argentina (12:55 UTC) - para reservar Sábado 10:00
+    - cron: '55 12 * * 5'
+    # Sábado 9:55 Argentina (12:55 UTC) - para reservar Domingo 10:00
+    - cron: '55 12 * * 6'
   
   # También permitir ejecución manual
   workflow_dispatch:
@@ -16,6 +19,7 @@ on:
 jobs:
   reservar-cancha:
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # Máximo 20 minutos de ejecución
     
     steps:
       - name: Checkout código
