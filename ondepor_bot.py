@@ -3,16 +3,15 @@ OnDepor - Bot de Reserva Automática de Canchas de Pádel
 =======================================================
 Automatiza la reserva de canchas en CISSAB a través de ondepor.com
 
+SISTEMA DE REINTENTOS:
+- El bot arranca 2 minutos antes de que se habilite la reserva
+- Intenta cada 5 segundos hasta conseguir la reserva
+- Timeout máximo de 10 minutos
+
 Variables de entorno requeridas:
     ONDEPOR_USER: Email de login
     ONDEPOR_PASS: Contraseña
-
-Configuración:
-    - Días: Sábados y Domingos
-    - Horarios: 10:00 o 11:00 (prioridad 10:00)
-    - Cancha: Preferencia KINERET (05-08), si no otra disponible
-    - Socios: Alan Garbo, Gabriel Topor, Damian Potap
-    - Actividad: PÁDEL DIURNO
+    ONDEPOR_SOCIOS: (opcional) Lista de socios separados por coma
 
 Uso:
     python ondepor_bot.py
@@ -31,6 +30,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # =============================================================================
 # CONFIGURACIÓN
 # =============================================================================
+
+# Configuración del sistema de reintentos
+RETRY_INTERVAL_SECONDS = 3      # Intentar cada 3 segundos (más agresivo)
+MAX_RETRY_MINUTES = 15          # Máximo 15 minutos de intentos
+START_MINUTES_BEFORE = 5        # Arrancar 5 minutos antes
+
 
 def get_config():
     """Obtiene configuración desde variables de entorno."""
@@ -64,7 +69,7 @@ def get_config():
         
         # Preferencias de reserva
         "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["14:00", "10:00", "11:00"],  # En orden de prioridad
+        "horarios_preferidos": ["10:00", "11:00"],  # En orden de prioridad
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
@@ -76,7 +81,7 @@ def get_config():
         # Timeouts
         "timeout_navegacion": 30000,
         "timeout_elemento": 10000,
-        "delay_entre_acciones": 1500,
+        "delay_entre_acciones": 1000,  # Reducido para ser más rápido
     }
 
 
@@ -160,9 +165,7 @@ def ir_a_padel_diurno(page, config):
         pass
     
     # Buscar y clickear en PÁDEL DIURNO
-    # El elemento es un <h4>CISSAB | PÁDEL DIURNO</h4> dentro de un div clickeable
     try:
-        # Intentar click en el contenedor o en el h4
         selectores = [
             'h4:has-text("PÁDEL DIURNO")',
             'div[id*="club_id"]:has-text("PÁDEL DIURNO")',
@@ -191,50 +194,32 @@ def ir_a_padel_diurno(page, config):
 
 
 def navegar_a_dia(page, dia_objetivo):
-    """
-    Navega en el calendario hasta el día objetivo.
-    
-    Args:
-        page: Página de Playwright
-        dia_objetivo: datetime del día a reservar
-    """
+    """Navega en el calendario hasta el día objetivo."""
     print(f"\n📅 Navegando al día {dia_objetivo.strftime('%d/%m/%Y')}...")
-    
-    # El calendario muestra la semana actual
-    # Necesitamos navegar con las flechas si el día está en otra semana
     
     max_intentos = 10
     for intento in range(max_intentos):
-        # Buscar si el día está visible
-        # Los días tienen formato: número + día de semana (ej: "8 DOMINGO")
         dia_num = dia_objetivo.day
-        
-        # Buscar celda del día objetivo
-        # Las celdas de día están en el header del calendario
         celdas_dia = page.locator(f'td:has-text("{dia_num}")').all()
         
         for celda in celdas_dia:
             texto = celda.inner_text()
             if str(dia_num) in texto:
-                # Verificamos que sea el día correcto mirando el mes
-                # Por ahora asumimos que es correcto
                 print(f"   ✅ Día {dia_num} encontrado en el calendario")
                 return True
         
-        # Si no está, navegar a la siguiente semana
         try:
             page.click('xpath=//div[contains(@class,"calendar-month")]//following-sibling::*[contains(@class,"next")] | //a[contains(@class,"next")]', timeout=2000)
             time.sleep(1)
         except:
             try:
-                # Intentar con flecha derecha
                 page.click('[class*="next"], [class*="arrow-right"]', timeout=2000)
                 time.sleep(1)
             except:
                 break
     
     print(f"   ⚠️ No se pudo navegar al día {dia_num}")
-    return True  # Continuamos de todas formas
+    return True
 
 
 # =============================================================================
@@ -242,24 +227,10 @@ def navegar_a_dia(page, dia_objetivo):
 # =============================================================================
 
 def buscar_horario_disponible(page, config):
-    """
-    Busca un horario disponible según las preferencias.
-    
-    Returns:
-        Elemento de la celda disponible o None
-    """
-    print("\n🔍 Buscando horarios disponibles...")
-    
-    # Esperar a que cargue el calendario
-    time.sleep(2)
+    """Busca un horario disponible según las preferencias."""
     
     for horario in config["horarios_preferidos"]:
-        print(f"   Buscando horario {horario}...")
-        
-        # Buscar celdas con data-id que contenga el horario
-        # Formato: data-id="time-10:00-club-1102-TIMESTAMP"
         selector = f'td[data-id*="time-{horario}"]:not(.disabled)'
-        
         celdas = page.locator(selector).all()
         
         for celda in celdas:
@@ -267,21 +238,29 @@ def buscar_horario_disponible(page, config):
                 texto = celda.inner_text()
                 clase = celda.get_attribute("class") or ""
                 
-                # Verificar que no esté completo/deshabilitado
                 if "disabled" in clase:
                     continue
                 
-                # Verificar que tenga lugares libres
                 if "libres" in texto.lower() or texto.strip().isdigit():
                     data_id = celda.get_attribute("data-id")
-                    print(f"   ✅ Encontrado: {horario} con {texto.strip()}")
                     return celda, horario
                     
             except Exception as e:
                 continue
     
-    print("   ❌ No se encontraron horarios disponibles")
     return None, None
+
+
+def refrescar_calendario(page, config):
+    """Refresca el calendario para ver nuevos horarios disponibles."""
+    try:
+        # Refrescar la página actual
+        page.reload()
+        page.wait_for_load_state("networkidle")
+        time.sleep(1)
+        return True
+    except:
+        return False
 
 
 def seleccionar_cancha_preferida(page, config):
@@ -289,13 +268,9 @@ def seleccionar_cancha_preferida(page, config):
     print("   🎾 Seleccionando cancha...")
     
     try:
-        # Obtener el selector de canchas
         selector = page.locator('#reservationform-court_id')
-        
-        # Obtener todas las opciones
         opciones = selector.locator('option').all()
         
-        # Buscar cancha KINERET primero
         for cancha_pref in config["canchas_preferidas"]:
             for opcion in opciones:
                 texto = opcion.inner_text().upper()
@@ -305,7 +280,6 @@ def seleccionar_cancha_preferida(page, config):
                     print(f"   ✅ Cancha seleccionada: {opcion.inner_text()}")
                     return True
         
-        # Si no hay KINERET, tomar la primera disponible
         if len(opciones) > 0:
             primera = opciones[0]
             valor = primera.get_attribute("value")
@@ -330,26 +304,20 @@ def agregar_socios(page, config):
         try:
             print(f"      Agregando: {socio}")
             
-            # Escribir nombre del socio
             input_socios.fill("")
             time.sleep(0.3)
-            input_socios.type(socio, delay=100)
+            input_socios.type(socio, delay=50)  # Más rápido
             
-            # Esperar a que aparezca el dropdown de autocompletado
-            time.sleep(1.5)
+            time.sleep(1)
             
-            # Seleccionar del dropdown
-            # El dropdown tiene role="listbox" y las opciones tienen la clase tt-suggestion
             try:
-                # Click en la primera sugerencia que coincida
                 sugerencia = page.locator(f'.tt-suggestion:has-text("{socio}"), .tt-menu div:has-text("{socio}")').first
                 sugerencia.click()
-                time.sleep(0.5)
+                time.sleep(0.3)
                 print(f"      ✅ {socio} agregado")
             except:
-                # Intentar presionar Enter si no hay dropdown
                 input_socios.press("Enter")
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
         except Exception as e:
             print(f"      ⚠️ Error agregando {socio}: {e}")
@@ -364,10 +332,9 @@ def aceptar_terminos(page):
     try:
         checkbox = page.locator('#reservationform-terms_and_cond')
         
-        # Verificar si ya está marcado
         if not checkbox.is_checked():
             checkbox.click()
-            time.sleep(0.5)
+            time.sleep(0.3)
         
         print("   ✅ Términos aceptados")
         return True
@@ -378,9 +345,7 @@ def aceptar_terminos(page):
 
 def verificar_errores(page):
     """Verifica si hay mensajes de error en el modal."""
-    print("   🔍 Verificando errores...")
     
-    # Buscar mensajes de error (el div naranja/rojo con errores)
     errores = page.locator('.alert-danger, .alert-warning, [class*="error"], [style*="background"][style*="rgb(23"]').all()
     
     for error in errores:
@@ -393,12 +358,10 @@ def verificar_errores(page):
         except:
             continue
     
-    # También verificar el mensaje específico de "máximo de reservas"
     if page.locator('text=/máximo de reservas/i').count() > 0:
         print("   ⚠️ ERROR: Uno de los socios tiene el máximo de reservas permitidas")
         return False
     
-    print("   ✅ Sin errores detectados")
     return True
 
 
@@ -410,7 +373,6 @@ def confirmar_reserva(page, dry_run=False):
         print("   [DRY RUN] Simulando click en RESERVAR")
         return True
     
-    # Verificar si hay errores antes de confirmar
     if not verificar_errores(page):
         print("   ❌ No se puede confirmar, hay errores en el formulario")
         return False
@@ -419,21 +381,16 @@ def confirmar_reserva(page, dry_run=False):
         page.click('#btn_submit', timeout=5000)
         time.sleep(3)
         page.wait_for_load_state("networkidle")
-        
-        # Esperar el mensaje de confirmación
         time.sleep(2)
         
-        # Verificar si apareció el mensaje de éxito
         if page.locator('text=/reserva fue realizada/i').count() > 0:
             print("   ✅ Reserva confirmada exitosamente")
-            # Click en CERRAR si aparece
             try:
                 page.click('text="CERRAR"', timeout=3000)
             except:
                 pass
             return True
         else:
-            # Verificar si hay error
             if page.locator('text=/máximo de reservas/i').count() > 0:
                 print("   ❌ Error: máximo de reservas alcanzado")
                 return False
@@ -445,43 +402,43 @@ def confirmar_reserva(page, dry_run=False):
         return False
 
 
+def cerrar_modal(page):
+    """Cierra el modal de reserva si está abierto."""
+    try:
+        # Intentar cerrar con el botón X o CERRAR
+        page.click('button[data-dismiss="modal"], .close, text="CERRAR"', timeout=2000)
+        time.sleep(1)
+    except:
+        try:
+            # Presionar Escape
+            page.keyboard.press("Escape")
+            time.sleep(1)
+        except:
+            pass
+
+
 def realizar_reserva(page, config, celda_horario, horario, dry_run=False):
-    """
-    Realiza todo el proceso de reserva.
-    
-    Args:
-        page: Página de Playwright
-        config: Configuración
-        celda_horario: Elemento de la celda con el horario disponible
-        horario: String del horario (ej: "10:00")
-        dry_run: Si es True, no confirma la reserva
-    """
+    """Realiza todo el proceso de reserva."""
     print(f"\n{'='*50}")
     print(f"🎾 Reservando horario {horario}")
     print(f"{'='*50}")
     
     try:
-        # Click en la celda para abrir el modal
         celda_horario.click()
         time.sleep(2)
         
-        # Esperar a que aparezca el modal
         page.wait_for_selector('#popupModal.show, #popupModal[style*="display: block"]', timeout=5000)
         time.sleep(1)
         
-        # Seleccionar cancha preferida
         seleccionar_cancha_preferida(page, config)
         time.sleep(config["delay_entre_acciones"] / 1000)
         
-        # Agregar socios
         agregar_socios(page, config)
         time.sleep(config["delay_entre_acciones"] / 1000)
         
-        # Aceptar términos
         aceptar_terminos(page)
         time.sleep(config["delay_entre_acciones"] / 1000)
         
-        # Confirmar reserva
         if confirmar_reserva(page, dry_run):
             return True
         else:
@@ -490,6 +447,68 @@ def realizar_reserva(page, config, celda_horario, horario, dry_run=False):
     except Exception as e:
         print(f"❌ Error en reserva: {e}")
         return False
+
+
+# =============================================================================
+# SISTEMA DE REINTENTOS
+# =============================================================================
+
+def intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run=False):
+    """
+    Intenta hacer la reserva con reintentos.
+    
+    El sistema:
+    1. Busca horarios disponibles
+    2. Si no hay, espera RETRY_INTERVAL_SECONDS y refresca
+    3. Repite hasta conseguir o timeout
+    """
+    
+    tiempo_inicio = datetime.now()
+    tiempo_maximo = tiempo_inicio + timedelta(minutes=MAX_RETRY_MINUTES)
+    intento = 0
+    
+    print(f"\n🔄 SISTEMA DE REINTENTOS ACTIVADO")
+    print(f"   ⏰ Intervalo entre intentos: {RETRY_INTERVAL_SECONDS} segundos")
+    print(f"   ⏱️ Timeout máximo: {MAX_RETRY_MINUTES} minutos")
+    print(f"   🎯 Horarios buscados: {config['horarios_preferidos']}")
+    print("="*50)
+    
+    while datetime.now() < tiempo_maximo:
+        intento += 1
+        ahora = datetime.now()
+        tiempo_transcurrido = (ahora - tiempo_inicio).seconds
+        
+        print(f"\n🔄 Intento #{intento} [{ahora.strftime('%H:%M:%S')}] (transcurrido: {tiempo_transcurrido}s)")
+        
+        # Buscar horario disponible
+        print("   🔍 Buscando horarios disponibles...")
+        celda, horario = buscar_horario_disponible(page, config)
+        
+        if celda is not None:
+            print(f"   ✅ ¡HORARIO ENCONTRADO! {horario}")
+            
+            # Intentar hacer la reserva
+            if realizar_reserva(page, config, celda, horario, dry_run):
+                return True
+            else:
+                print("   ⚠️ Falló la reserva, reintentando...")
+                cerrar_modal(page)
+        else:
+            print(f"   ⏳ No hay horarios disponibles aún...")
+        
+        # Esperar antes del siguiente intento
+        print(f"   ⏰ Esperando {RETRY_INTERVAL_SECONDS} segundos...")
+        time.sleep(RETRY_INTERVAL_SECONDS)
+        
+        # Refrescar el calendario
+        print("   🔄 Refrescando calendario...")
+        refrescar_calendario(page, config)
+        
+        # Re-navegar al día si es necesario
+        navegar_a_dia(page, fecha_objetivo)
+    
+    print(f"\n❌ TIMEOUT: Se agotaron los {MAX_RETRY_MINUTES} minutos de intentos")
+    return False
 
 
 # =============================================================================
@@ -503,23 +522,24 @@ def ejecutar_bot(visible=False, dry_run=False):
     print("\n" + "="*60)
     print("🎾 ONDEPOR - BOT DE RESERVA DE PÁDEL")
     print("="*60)
-    print(f"📅 Fecha ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"📅 Fecha ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"👤 Usuario: {config['usuario']}")
     print(f"🎯 Actividad: {config['actividad']}")
     print(f"⏰ Horarios preferidos: {config['horarios_preferidos']}")
     print(f"👥 Socios: {', '.join(config['socios'])}")
+    print(f"🔄 Sistema de reintentos: Cada {RETRY_INTERVAL_SECONDS}s por {MAX_RETRY_MINUTES} min")
     if dry_run:
         print("⚠️  MODO DRY-RUN: No se harán reservas reales")
     print("="*60)
     
     # Calcular fecha objetivo (mañana, ya que el bot corre 24hs antes)
-    fecha_objetivo = datetime.now() + timedelta(days=0)
+    fecha_objetivo = datetime.now() + timedelta(days=1)
     print(f"\n📆 Fecha a reservar: {fecha_objetivo.strftime('%A %d/%m/%Y')}")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=not visible,
-            slow_mo=500 if visible else 0
+            slow_mo=300 if visible else 0
         )
         
         context = browser.new_context(
@@ -544,21 +564,14 @@ def ejecutar_bot(visible=False, dry_run=False):
             # Navegar al día objetivo
             navegar_a_dia(page, fecha_objetivo)
             
-            # Buscar horario disponible
-            celda, horario = buscar_horario_disponible(page, config)
-            
-            if celda is None:
-                print("\n❌ No se encontraron horarios disponibles")
-                sys.exit(1)
-            
-            # Realizar la reserva
-            if realizar_reserva(page, config, celda, horario, dry_run):
+            # Intentar reserva con reintentos
+            if intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run):
                 print("\n" + "="*60)
                 print("✅ RESERVA COMPLETADA EXITOSAMENTE")
                 print("="*60)
             else:
                 print("\n" + "="*60)
-                print("❌ ERROR EN LA RESERVA")
+                print("❌ NO SE PUDO COMPLETAR LA RESERVA")
                 print("="*60)
                 sys.exit(1)
                 
