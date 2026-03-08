@@ -513,7 +513,7 @@ def ejecutar_bot(visible=False, dry_run=False):
     print("="*60)
     
     # Calcular fecha objetivo (mañana, ya que el bot corre 24hs antes)
-    fecha_objetivo = datetime.now() + timedelta(days=1)
+    fecha_objetivo = datetime.now() + timedelta(days=0)
     print(f"\n📆 Fecha a reservar: {fecha_objetivo.strftime('%A %d/%m/%Y')}")
     
     with sync_playwright() as p:
