@@ -69,7 +69,7 @@ def get_config():
         
         # Preferencias de reserva
         "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["09:00", "10:00"],  # En orden de prioridad
+        "horarios_preferidos": ["10:00", "11:00"],  # En orden de prioridad
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
@@ -226,10 +226,22 @@ def navegar_a_dia(page, dia_objetivo):
 # FUNCIONES DE RESERVA
 # =============================================================================
 
-def buscar_horario_disponible(page, config):
-    """Busca un horario disponible según las preferencias."""
+def buscar_horario_disponible(page, config, fecha_objetivo):
+    """Busca un horario disponible según las preferencias PARA EL DÍA CORRECTO."""
+    
+    # Calcular el timestamp Unix para el día objetivo (a las 00:00)
+    # El timestamp en el data-id representa la fecha/hora del turno
+    fecha_inicio_dia = fecha_objetivo.replace(hour=0, minute=0, second=0, microsecond=0)
+    fecha_fin_dia = fecha_objetivo.replace(hour=23, minute=59, second=59, microsecond=0)
+    
+    timestamp_inicio = int(fecha_inicio_dia.timestamp())
+    timestamp_fin = int(fecha_fin_dia.timestamp())
+    
+    print(f"   📅 Buscando para fecha: {fecha_objetivo.strftime('%d/%m/%Y')}")
+    print(f"   🔢 Rango timestamps: {timestamp_inicio} - {timestamp_fin}")
     
     for horario in config["horarios_preferidos"]:
+        print(f"   Buscando horario {horario}...")
         selector = f'td[data-id*="time-{horario}"]:not(.disabled)'
         celdas = page.locator(selector).all()
         
@@ -237,13 +249,28 @@ def buscar_horario_disponible(page, config):
             try:
                 texto = celda.inner_text()
                 clase = celda.get_attribute("class") or ""
+                data_id = celda.get_attribute("data-id") or ""
                 
                 if "disabled" in clase:
                     continue
                 
-                if "libres" in texto.lower() or texto.strip().isdigit():
-                    data_id = celda.get_attribute("data-id")
-                    return celda, horario
+                # Extraer el timestamp del data-id
+                # Formato: time-HH:MM-club-CLUBID-TIMESTAMP
+                partes = data_id.split("-")
+                if len(partes) >= 5:
+                    try:
+                        timestamp_celda = int(partes[-1])
+                        
+                        # Verificar si el timestamp corresponde al día objetivo
+                        if timestamp_inicio <= timestamp_celda <= timestamp_fin:
+                            if "libres" in texto.lower() or texto.strip().isdigit():
+                                print(f"   ✅ Encontrado: {horario} (timestamp: {timestamp_celda})")
+                                return celda, horario
+                        else:
+                            # Es de otro día, ignorar
+                            continue
+                    except ValueError:
+                        continue
                     
             except Exception as e:
                 continue
@@ -482,7 +509,7 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run=False)
         
         # Buscar horario disponible
         print("   🔍 Buscando horarios disponibles...")
-        celda, horario = buscar_horario_disponible(page, config)
+        celda, horario = buscar_horario_disponible(page, config, fecha_objetivo)
         
         if celda is not None:
             print(f"   ✅ ¡HORARIO ENCONTRADO! {horario}")
