@@ -69,7 +69,7 @@ def get_config():
         
         # Preferencias de reserva
         "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["08:00", "14:00"],  # En orden de prioridad
+        "horarios_preferidos": ["09:00", "14:00"],  # En orden de prioridad
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
