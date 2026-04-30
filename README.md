@@ -1,110 +1,101 @@
 # 🎾 OnDepor - Reserva Web de Pádel
 
-Interfaz web para disparar el bot de reserva de canchas en CISSAB. La web dispara un workflow de GitHub Actions vía la API de GitHub, así que el bot sigue corriendo en GitHub (gratis, sin necesidad de tener tu PC prendida).
+Interfaz web para disparar el bot de reserva en CISSAB. Soporta dos modos:
+- **⚡ Reservar ahora**: ejecuta el bot inmediatamente (modo original)
+- **⏰ Programar**: el bot espera en GitHub Actions hasta el momento exacto que vos elijas, y arranca a intentar 2 min antes
 
 ## 📁 Archivos
 
-- `ondepor_bot.py` → Bot modificado, ahora lee horario/fecha/socios desde variables de entorno
-- `ondepor.yml` → Workflow de GitHub Actions (sin schedule, solo manual con inputs). Va en `.github/workflows/`
-- `index.html` → Página web. Podés abrirla local (doble click) o subirla a GitHub Pages
+- `ondepor_bot.py` → Bot con modo programado (ventana de -2min a +5min)
+- `ondepor.yml` → Workflow con timeout extendido a 6 horas. Va en `.github/workflows/`
+- `index.html` → Web con toggle entre los dos modos
 
-## 🚀 Setup paso a paso
+## 🚀 Setup (si ya tenías la versión anterior, solo reemplazá los 3 archivos)
 
 ### 1. Reemplazar archivos en tu repo
 
-En tu repositorio de GitHub:
-- Reemplazá `ondepor_bot.py` por el nuevo
-- Reemplazá `.github/workflows/ondepor.yml` por el nuevo
-- Hacé commit y push
+- Reemplazá `ondepor_bot.py`
+- Reemplazá `.github/workflows/ondepor.yml` (el timeout pasó a 6 horas)
+- Commit + push
 
-### 2. Crear el Personal Access Token de GitHub
+### 2. La web
 
-1. Andá a https://github.com/settings/tokens?type=beta (Fine-grained tokens)
-2. Click en **Generate new token**
-3. Configurá:
-   - **Token name**: `ondepor-bot-trigger`
-   - **Expiration**: 1 año (o lo que prefieras)
-   - **Repository access**: Only select repositories → elegí tu repo del bot
-   - **Permissions** → Repository permissions:
-     - **Actions**: Read and write
-     - **Metadata**: Read-only (se marca solo)
-4. Click en **Generate token** y copiá el token (empieza con `github_pat_...`)
-5. ⚠️ Guardalo bien, GitHub solo te lo muestra una vez
+Misma URL que ya usabas (sea local o GitHub Pages). Solo bajate el nuevo `index.html` y abrilo.
 
-> 💡 Si preferís un token clásico, también funciona con scope `workflow`, pero los fine-grained son más seguros.
+> ⚙️ La configuración de GitHub (token, owner, repo) y la lista de jugadores se mantienen — están en `localStorage`.
 
-### 3. Abrir la web
+## 🎯 Cómo usar el modo programado
 
-**Opción A: Local (más fácil)**
-- Hacé doble click en `index.html` y se abre en el navegador
-- Listo
+1. Llená el formulario como siempre (actividad, fecha del turno, jugadores, horarios)
+2. En **Modo de ejecución**, click en **⏰ Programar**
+3. Aparecen 2 nuevos campos:
+   - **Fecha del disparo**: el día EN QUE EL CLUB HABILITA la reserva (no el día del turno)
+   - **Hora del disparo**: la hora EXACTA en que el sistema habilita (HH:MM)
+4. Click en **⏰ PROGRAMAR RESERVA**
+5. Listo — podés cerrar la pestaña, el bot espera en GitHub Actions
 
-**Opción B: GitHub Pages (accesible desde cualquier lado)**
-1. Creá un repo nuevo (puede ser privado): `ondepor-web`
-2. Subí el `index.html`
-3. Settings → Pages → Source: `Deploy from a branch` → `main` / `/(root)`
-4. Te da una URL tipo `https://tu-usuario.github.io/ondepor-web/`
+### Ejemplo concreto
 
-### 4. Configurar la web (la primera vez)
+Querés jugar el **sábado 3 de mayo a las 10:00**. El club habilita las reservas con 24hs de anticipación, o sea **viernes 2 de mayo a las 10:00**.
 
-1. Abrí la web
-2. Click en **⚙️ Configuración GitHub**
-3. Pegá:
-   - **Token**: el que creaste antes
-   - **Owner**: tu usuario de GitHub
-   - **Repo**: el nombre del repo donde está el bot
-   - **Workflow file**: `ondepor.yml` (default, no cambies si no es necesario)
-4. Click en **💾 Guardar configuración**
+| Campo | Valor |
+|---|---|
+| Fecha del turno | 2026-05-03 |
+| Horarios del turno | 10:00, 09:00 |
+| Modo | ⏰ Programar |
+| Fecha del disparo | 2026-05-02 |
+| Hora del disparo | 10:00 |
 
-> 🔒 Todo se guarda en `localStorage` de tu navegador. No se manda a ningún servidor externo.
+El bot va a:
+1. Quedarse esperando en GitHub Actions hasta el viernes 09:58 ARG
+2. Empezar a intentar a las 09:58
+3. Seguir intentando cada 3 segundos hasta lograr la reserva
+4. Si a las 10:05 no lo logró, abandona
 
-### 5. Reservar 🎾
+## ⏱️ Ventana de intentos
 
-1. Elegí actividad (DIURNO/NOCTURNO)
-2. Elegí fecha (default: mañana)
-3. Click en 3 socios (vos sos el cuarto jugador, no te selecciones a vos)
-4. Click en los horarios en orden de prioridad (el primer click = prioridad 1, etc.)
-5. Click en **🚀 RESERVAR**
-6. La web va a:
-   - Disparar el workflow
-   - Hacer polling cada 5 segundos
-   - Mostrarte el resultado cuando termine (éxito/error con link a los logs)
+```
+hora_objetivo - 2 min  ──→  empieza a intentar
+hora_objetivo          ──→  el club habilita
+hora_objetivo + 5 min  ──→  abandona si no consiguió
+```
 
-## ⏱️ Tiempos esperables
+Total: **7 minutos** de intentos cada 3 segundos.
 
-- ~5-10 segundos para que arranque el runner de GitHub
-- ~30-60 segundos instalando dependencias (Playwright + Chromium)
-- ~10-15 minutos máximo del bot intentando la reserva
-- **Total**: 1-2 minutos en el caso bueno (cancha disponible al toque)
+## ⚠️ Límites a tener en cuenta
 
-## 🔧 Agregar/quitar jugadores
-
-La lista de jugadores la podés editar directo desde la web (botón "+" para agregar). Se guarda en el navegador.
-
-Si querés resetear a la lista default, hay un link "Resetear lista a la default".
+- **GitHub Actions tiene un límite de 6 horas por job.** Si programás más de 6h adelante, el job se va a matar antes de la hora. La web te avisa si estás cerca del límite.
+- **Tiempo de cómputo gratis**: 2.000 min/mes en repos privados. Si programás 5h adelante, eso "consume" 5h. Hacelo cuenta si vas a programar muchas reservas.
+- **La hora se interpreta como Argentina (UTC-3)**, sin importar desde qué dispositivo dispares. Si viajás y querés programar desde otro país, igual pensá en hora ARG.
 
 ## 🐛 Troubleshooting
 
-**Error 401 / 403 al disparar**
-- Token expirado o sin permisos. Generá uno nuevo y guardalo en config.
+**"El workflow se disparó pero no encuentra el día del turno"**
+- Probablemente la fecha del turno está mal. La fecha del **turno** es el día que querés jugar, no el día que disparás.
 
-**Error 404 "Not Found"**
-- Owner/Repo mal escritos, o el workflow no está en `main`.
-- Verificá que `ondepor.yml` esté en `.github/workflows/` y haya hecho push.
+**"Pasaron las 10:05 y nada"**
+- Revisá los logs en GitHub Actions. Lo más común: la lista de horarios estaba vacía, o todos los horarios estaban tomados al momento del disparo.
 
-**El workflow corre pero falla**
-- Click en "Ver en GitHub Actions" desde la web para ver los logs.
-- Lo más común: que `ONDEPOR_USER` o `ONDEPOR_PASS` no estén configurados como Secrets del repo (Settings → Secrets and variables → Actions).
+**"Quiero cancelar una reserva programada"**
+- Andá a la pestaña Actions de tu repo en GitHub, abrí el run que está corriendo, y hacé click en "Cancel workflow" arriba a la derecha.
 
-**No encuentra el horario / la cancha**
-- El bot busca en CISSAB con la actividad que elegiste. Si elegiste NOCTURNO pero el club no la tiene habilitada para esa fecha, no va a encontrar nada.
+**"El bot no esperó y arrancó al toque"**
+- Verificá que pusiste fecha Y hora del disparo en la web (en modo programado). Si alguno está vacío, cae en modo inmediato.
 
-## 📝 Notas técnicas
+## 📝 Notas técnicas (cambios vs la versión anterior)
 
-- El bot ahora acepta 4 variables de entorno nuevas (todas opcionales):
-  - `ONDEPOR_HORARIOS` (ej: `"10:00,09:00"`)
-  - `ONDEPOR_FECHA` (ej: `"2026-05-15"`, vacío = mañana)
-  - `ONDEPOR_ACTIVIDAD` (`DIURNO` o `NOCTURNO`)
-  - `ONDEPOR_SOCIOS` (igual que antes)
-- Si no se pasan, usa los defaults originales (compatible hacia atrás)
-- El schedule automático fue eliminado del YAML. Si lo querés restaurar, copiá las líneas `schedule:` del YAML viejo.
+### Bot
+- Nueva variable `ONDEPOR_HORA_OBJETIVO` (HH:MM, hora ARG)
+- Nueva variable `ONDEPOR_FECHA_OBJETIVO` (YYYY-MM-DD, opcional, default = hoy)
+- Si están definidas, el bot espera con `time.sleep` antes de levantar el browser
+- La ventana de reintentos ahora es atada al momento objetivo, no al inicio
+
+### Workflow
+- `timeout-minutes: 360` (era 20) — necesario para soportar la espera
+- Dos inputs nuevos: `hora_objetivo` y `fecha_objetivo`
+
+### Web
+- Tabs "Reservar ahora" / "Programar"
+- Selector de fecha+hora en modo programado
+- Conversión de hora local ARG a UTC manejada en JS (siempre interpreta como UTC-3)
+- Polling más espaciado (cada 30s) en modo programado para ahorrar rate limit
