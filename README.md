@@ -1,108 +1,110 @@
-# 🎾 OnDepor - Bot de Reserva de Pádel
+# 🎾 OnDepor - Reserva Web de Pádel
 
-Bot automático para reservar canchas de pádel en CISSAB a través de ondepor.com.
+Interfaz web para disparar el bot de reserva de canchas en CISSAB. La web dispara un workflow de GitHub Actions vía la API de GitHub, así que el bot sigue corriendo en GitHub (gratis, sin necesidad de tener tu PC prendida).
 
-## Configuración actual
+## 📁 Archivos
 
-| Parámetro | Valor |
-|-----------|-------|
-| **Días** | Sábados y Domingos |
-| **Horarios** | 10:00 o 11:00 (prioridad 10:00) |
-| **Cancha** | Preferencia KINERET (05-08) |
-| **Socios** | Alan Garbo, Gabriel Topor, Damian Potap |
-| **Actividad** | PÁDEL DIURNO |
+- `ondepor_bot.py` → Bot modificado, ahora lee horario/fecha/socios desde variables de entorno
+- `ondepor.yml` → Workflow de GitHub Actions (sin schedule, solo manual con inputs). Va en `.github/workflows/`
+- `index.html` → Página web. Podés abrirla local (doble click) o subirla a GitHub Pages
 
-## Ejecución automática
+## 🚀 Setup paso a paso
 
-El bot corre automáticamente 24 horas antes:
+### 1. Reemplazar archivos en tu repo
 
-- **Viernes 10:00** → Reserva para Sábado 10:00
-- **Sábado 10:00** → Reserva para Domingo 10:00
+En tu repositorio de GitHub:
+- Reemplazá `ondepor_bot.py` por el nuevo
+- Reemplazá `.github/workflows/ondepor.yml` por el nuevo
+- Hacé commit y push
 
-## Configuración en GitHub
+### 2. Crear el Personal Access Token de GitHub
 
-### 1. Crear repositorio
+1. Andá a https://github.com/settings/tokens?type=beta (Fine-grained tokens)
+2. Click en **Generate new token**
+3. Configurá:
+   - **Token name**: `ondepor-bot-trigger`
+   - **Expiration**: 1 año (o lo que prefieras)
+   - **Repository access**: Only select repositories → elegí tu repo del bot
+   - **Permissions** → Repository permissions:
+     - **Actions**: Read and write
+     - **Metadata**: Read-only (se marca solo)
+4. Click en **Generate token** y copiá el token (empieza con `github_pat_...`)
+5. ⚠️ Guardalo bien, GitHub solo te lo muestra una vez
 
-1. Ir a [github.com](https://github.com) 
-2. Crear nuevo repositorio **privado** (ej: `ondepor-bot`)
+> 💡 Si preferís un token clásico, también funciona con scope `workflow`, pero los fine-grained son más seguros.
 
-### 2. Subir archivos
+### 3. Abrir la web
 
-Subir estos archivos manteniendo la estructura:
+**Opción A: Local (más fácil)**
+- Hacé doble click en `index.html` y se abre en el navegador
+- Listo
 
-```
-ondepor-bot/
-├── .github/
-│   └── workflows/
-│       └── ondepor.yml
-├── ondepor_bot.py
-└── README.md
-```
+**Opción B: GitHub Pages (accesible desde cualquier lado)**
+1. Creá un repo nuevo (puede ser privado): `ondepor-web`
+2. Subí el `index.html`
+3. Settings → Pages → Source: `Deploy from a branch` → `main` / `/(root)`
+4. Te da una URL tipo `https://tu-usuario.github.io/ondepor-web/`
 
-### 3. Configurar credenciales (Secrets)
+### 4. Configurar la web (la primera vez)
 
-1. En el repositorio → **Settings** → **Secrets and variables** → **Actions**
-2. Click **"New repository secret"**
-3. Crear:
+1. Abrí la web
+2. Click en **⚙️ Configuración GitHub**
+3. Pegá:
+   - **Token**: el que creaste antes
+   - **Owner**: tu usuario de GitHub
+   - **Repo**: el nombre del repo donde está el bot
+   - **Workflow file**: `ondepor.yml` (default, no cambies si no es necesario)
+4. Click en **💾 Guardar configuración**
 
-   | Name | Value |
-   |------|-------|
-   | `ONDEPOR_USER` | `aprync@gmail.com` |
-   | `ONDEPOR_PASS` | `tu_contraseña` |
+> 🔒 Todo se guarda en `localStorage` de tu navegador. No se manda a ningún servidor externo.
 
-### 4. Probar
+### 5. Reservar 🎾
 
-1. Ir a **Actions** → **OnDepor - Reserva Pádel**
-2. Click **"Run workflow"** → **"Run workflow"**
-3. Ver el resultado
+1. Elegí actividad (DIURNO/NOCTURNO)
+2. Elegí fecha (default: mañana)
+3. Click en 3 socios (vos sos el cuarto jugador, no te selecciones a vos)
+4. Click en los horarios en orden de prioridad (el primer click = prioridad 1, etc.)
+5. Click en **🚀 RESERVAR**
+6. La web va a:
+   - Disparar el workflow
+   - Hacer polling cada 5 segundos
+   - Mostrarte el resultado cuando termine (éxito/error con link a los logs)
 
-## Modificar preferencias
+## ⏱️ Tiempos esperables
 
-Editar `ondepor_bot.py`, sección de configuración:
+- ~5-10 segundos para que arranque el runner de GitHub
+- ~30-60 segundos instalando dependencias (Playwright + Chromium)
+- ~10-15 minutos máximo del bot intentando la reserva
+- **Total**: 1-2 minutos en el caso bueno (cancha disponible al toque)
 
-```python
-# Horarios preferidos (en orden de prioridad)
-"horarios_preferidos": ["10:00", "11:00"],
+## 🔧 Agregar/quitar jugadores
 
-# Socios a agregar
-"socios": [
-    "Alan Garbo",
-    "Gabriel Topor",
-    "Damian Potap"
-],
-```
+La lista de jugadores la podés editar directo desde la web (botón "+" para agregar). Se guarda en el navegador.
 
-## Cambiar horario de ejecución
+Si querés resetear a la lista default, hay un link "Resetear lista a la default".
 
-Editar `.github/workflows/ondepor.yml`:
+## 🐛 Troubleshooting
 
-```yaml
-schedule:
-  # Formato: minuto hora * * día_semana
-  # Viernes 10:00 ARG = 13:00 UTC
-  - cron: '0 13 * * 5'
-  # Sábado 10:00 ARG = 13:00 UTC
-  - cron: '0 13 * * 6'
-```
+**Error 401 / 403 al disparar**
+- Token expirado o sin permisos. Generá uno nuevo y guardalo en config.
 
-**Ejemplos de horarios:**
-- `'0 14 * * 5'` → Viernes 11:00 ARG (para reservar Sábado 11:00)
-- `'0 20 * * 5'` → Viernes 17:00 ARG (para reservar Sábado 17:00 - NOCTURNO)
+**Error 404 "Not Found"**
+- Owner/Repo mal escritos, o el workflow no está en `main`.
+- Verificá que `ondepor.yml` esté en `.github/workflows/` y haya hecho push.
 
-## Troubleshooting
+**El workflow corre pero falla**
+- Click en "Ver en GitHub Actions" desde la web para ver los logs.
+- Lo más común: que `ONDEPOR_USER` o `ONDEPOR_PASS` no estén configurados como Secrets del repo (Settings → Secrets and variables → Actions).
 
-### El login falla
-Verificar credenciales en GitHub Secrets.
+**No encuentra el horario / la cancha**
+- El bot busca en CISSAB con la actividad que elegiste. Si elegiste NOCTURNO pero el club no la tiene habilitada para esa fecha, no va a encontrar nada.
 
-### No encuentra horarios
-El horario puede ya estar tomado. El bot corre justo cuando se habilita, pero si alguien es más rápido...
+## 📝 Notas técnicas
 
-### No encuentra socios
-Verificar que los nombres coincidan exactamente con cómo aparecen en OnDepor.
-
-### Para PÁDEL NOCTURNO
-Cambiar en `ondepor_bot.py`:
-```python
-"actividad": "PÁDEL NOCTURNO",
-"horarios_preferidos": ["19:00", "20:00", "21:00"],
-```
+- El bot ahora acepta 4 variables de entorno nuevas (todas opcionales):
+  - `ONDEPOR_HORARIOS` (ej: `"10:00,09:00"`)
+  - `ONDEPOR_FECHA` (ej: `"2026-05-15"`, vacío = mañana)
+  - `ONDEPOR_ACTIVIDAD` (`DIURNO` o `NOCTURNO`)
+  - `ONDEPOR_SOCIOS` (igual que antes)
+- Si no se pasan, usa los defaults originales (compatible hacia atrás)
+- El schedule automático fue eliminado del YAML. Si lo querés restaurar, copiá las líneas `schedule:` del YAML viejo.
