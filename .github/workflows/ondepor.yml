@@ -1,20 +1,31 @@
 name: OnDepor - Reserva Pádel
 
 on:
-  # Ejecutar automáticamente para reservar:
-  # El sistema habilita a las XX:01, así que arrancamos a las XX:55 (5 min antes)
-  # para tener margen y estar listos esperando
-  # 
-  # Sábado 10:00 → Viernes 9:55 (12:55 UTC)
-  # Domingo 10:00 → Sábado 9:55 (12:55 UTC)
-  schedule:
-    # Viernes 9:55 Argentina (12:55 UTC) - para reservar Sábado 10:00
-    - cron: '55 12 * * 5'
-    # Sábado 9:55 Argentina (12:55 UTC) - para reservar Domingo 10:00
-    - cron: '55 12 * * 6'
-  
-  # También permitir ejecución manual
+  # Solo ejecución manual (desde la web o desde la UI de GitHub)
   workflow_dispatch:
+    inputs:
+      socios:
+        description: 'Socios separados por coma (ej: Alan Garbo,Gabriel Topor,Damian Potap)'
+        required: true
+        type: string
+      horarios:
+        description: 'Horarios preferidos separados por coma (ej: 10:00,09:00)'
+        required: true
+        type: string
+        default: '10:00,09:00'
+      fecha:
+        description: 'Fecha a reservar en formato YYYY-MM-DD (vacío = mañana)'
+        required: false
+        type: string
+        default: ''
+      actividad:
+        description: 'Tipo de pádel'
+        required: true
+        type: choice
+        options:
+          - DIURNO
+          - NOCTURNO
+        default: DIURNO
 
 jobs:
   reservar-cancha:
@@ -36,11 +47,22 @@ jobs:
           playwright install chromium
           playwright install-deps
       
+      - name: Mostrar parámetros recibidos
+        run: |
+          echo "🎾 Parámetros de la reserva:"
+          echo "   Socios:    ${{ inputs.socios }}"
+          echo "   Horarios:  ${{ inputs.horarios }}"
+          echo "   Fecha:     ${{ inputs.fecha || 'mañana (default)' }}"
+          echo "   Actividad: ${{ inputs.actividad }}"
+      
       - name: Ejecutar bot de reserva
         env:
           ONDEPOR_USER: ${{ secrets.ONDEPOR_USER }}
           ONDEPOR_PASS: ${{ secrets.ONDEPOR_PASS }}
-          ONDEPOR_SOCIOS: ${{ secrets.ONDEPOR_SOCIOS }}
+          ONDEPOR_SOCIOS: ${{ inputs.socios }}
+          ONDEPOR_HORARIOS: ${{ inputs.horarios }}
+          ONDEPOR_FECHA: ${{ inputs.fecha }}
+          ONDEPOR_ACTIVIDAD: ${{ inputs.actividad }}
         run: python ondepor_bot.py
       
       - name: Notificar resultado
