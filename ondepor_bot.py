@@ -3,23 +3,36 @@ OnDepor - Bot de Reserva Automática de Canchas de Pádel
 =======================================================
 Automatiza la reserva de canchas en CISSAB a través de ondepor.com
 
-SISTEMA DE REINTENTOS:
-- El bot arranca 2 minutos antes de que se habilite la reserva
-- Intenta cada 5 segundos hasta conseguir la reserva
-- Timeout máximo de 10 minutos
+MODOS DE EJECUCIÓN:
+1. Inmediato: El bot arranca a intentar la reserva apenas se ejecuta
+2. Programado: Si se define ONDEPOR_HORA_OBJETIVO, espera hasta
+   (hora_objetivo - 2 min) y recién ahí empieza a intentar.
+   Sigue intentando hasta 5 min DESPUÉS de la hora objetivo.
+
+VENTANA DE INTENTOS (modo programado):
+- Inicio: hora_objetivo - 2 min  (START_MINUTES_BEFORE)
+- Fin:    hora_objetivo + 5 min  (END_MINUTES_AFTER)
+- Total:  7 min de intentos cada RETRY_INTERVAL_SECONDS
 
 Variables de entorno requeridas:
-    ONDEPOR_USER:       Email de login
-    ONDEPOR_PASS:       Contraseña
+    ONDEPOR_USER:           Email de login
+    ONDEPOR_PASS:           Contraseña
 
 Variables de entorno opcionales (configurables desde la web):
-    ONDEPOR_SOCIOS:     Lista de socios separados por coma
-                        Ej: "Alan Garbo,Gabriel Topor,Damian Potap"
-    ONDEPOR_HORARIOS:   Horarios preferidos en orden de prioridad
-                        Ej: "10:00,09:00"
-    ONDEPOR_FECHA:      Fecha objetivo en formato YYYY-MM-DD
-                        Si no se indica, usa mañana (default)
-    ONDEPOR_ACTIVIDAD:  "DIURNO" o "NOCTURNO" (default: DIURNO)
+    ONDEPOR_SOCIOS:         Lista de socios separados por coma
+                            Ej: "Alan Garbo,Gabriel Topor,Damian Potap"
+    ONDEPOR_HORARIOS:       Horarios preferidos en orden de prioridad
+                            Ej: "10:00,09:00"
+    ONDEPOR_FECHA:          Fecha objetivo en formato YYYY-MM-DD
+                            Si no se indica, usa mañana (default)
+    ONDEPOR_ACTIVIDAD:      "DIURNO" o "NOCTURNO" (default: DIURNO)
+    ONDEPOR_HORA_OBJETIVO:  Hora local Argentina HH:MM en la que el sistema
+                            habilita la reserva. El bot esperará hasta
+                            (esa hora - 2 min) antes de empezar a intentar.
+                            Si no se indica, ejecuta inmediato (modo viejo).
+    ONDEPOR_FECHA_OBJETIVO: Fecha (YYYY-MM-DD) para el momento exacto del
+                            disparo. Solo se usa junto con ONDEPOR_HORA_OBJETIVO.
+                            Si no se indica, asume hoy.
 
 Uso:
     python ondepor_bot.py
@@ -31,7 +44,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
@@ -40,9 +53,14 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # =============================================================================
 
 # Configuración del sistema de reintentos
-RETRY_INTERVAL_SECONDS = 3      # Intentar cada 3 segundos (más agresivo)
-MAX_RETRY_MINUTES = 15          # Máximo 15 minutos de intentos
-START_MINUTES_BEFORE = 5        # Arrancar 5 minutos antes
+RETRY_INTERVAL_SECONDS = 3      # Intentar cada 3 segundos
+START_MINUTES_BEFORE = 2        # Arrancar 2 min antes de la hora objetivo
+END_MINUTES_AFTER = 5           # Cortar 5 min después de la hora objetivo
+# Modo inmediato (sin hora objetivo): ventana max de intentos
+MAX_RETRY_MINUTES_INMEDIATO = 15
+
+# Argentina: UTC-3 fijo (no usa horario de verano desde 2009)
+ARGENTINA_TZ = timezone(timedelta(hours=-3))
 
 
 def get_config():
@@ -56,27 +74,20 @@ def get_config():
         sys.exit(1)
     
     # Los socios se pueden configurar desde variable de entorno
-    # Formato: "Alan Garbo,Gabriel Topor,Damian Potap"
     socios_env = os.environ.get("ONDEPOR_SOCIOS", "")
     if socios_env:
         socios = [s.strip() for s in socios_env.split(",") if s.strip()]
     else:
-        # Socios por defecto
-        socios = [
-            "Alan Garbo",
-            "Gabriel Topor",
-            "Damian Potap"
-        ]
+        socios = ["Alan Garbo", "Gabriel Topor", "Damian Potap"]
     
-    # Horarios preferidos (configurable desde variable de entorno)
-    # Formato: "10:00,09:00"
+    # Horarios preferidos
     horarios_env = os.environ.get("ONDEPOR_HORARIOS", "")
     if horarios_env:
         horarios_preferidos = [h.strip() for h in horarios_env.split(",") if h.strip()]
     else:
         horarios_preferidos = ["09:00", "10:00"]
     
-    # Actividad: DIURNO o NOCTURNO
+    # Actividad
     actividad_env = os.environ.get("ONDEPOR_ACTIVIDAD", "DIURNO").upper().strip()
     if actividad_env not in ("DIURNO", "NOCTURNO"):
         actividad_env = "DIURNO"
@@ -88,45 +99,114 @@ def get_config():
         "url_favoritos": "https://www.ondepor.com/user/_favorites",
         "usuario": usuario,
         "password": password,
-        
-        # Preferencias de reserva
         "actividad": actividad,
         "horarios_preferidos": horarios_preferidos,
-        
-        # Canchas preferidas (en orden de prioridad)
-        # Las KINERET son las canchas 05-08
         "canchas_preferidas": ["KINERET", "05-", "06-", "07-", "08-"],
-        
-        # Socios a agregar (configurable via ONDEPOR_SOCIOS)
         "socios": socios,
-        
-        # Timeouts
         "timeout_navegacion": 30000,
         "timeout_elemento": 10000,
-        "delay_entre_acciones": 1000,  # Reducido para ser más rápido
+        "delay_entre_acciones": 1000,
     }
 
 
 def get_fecha_objetivo():
-    """
-    Calcula la fecha a reservar.
-    
-    Si está la variable ONDEPOR_FECHA con formato YYYY-MM-DD, la usa.
-    Caso contrario, usa mañana (comportamiento original).
-    """
+    """Calcula la fecha A RESERVAR (la del turno de pádel)."""
     fecha_env = os.environ.get("ONDEPOR_FECHA", "").strip()
     if fecha_env:
         try:
             fecha = datetime.strptime(fecha_env, "%Y-%m-%d")
-            # Le ponemos hora 12 del mediodía para evitar problemas con timezone
             fecha = fecha.replace(hour=12, minute=0, second=0, microsecond=0)
             print(f"📅 Usando fecha desde ONDEPOR_FECHA: {fecha.strftime('%d/%m/%Y')}")
             return fecha
         except ValueError:
             print(f"⚠️ ONDEPOR_FECHA inválida ('{fecha_env}'), usando mañana por defecto")
     
-    # Default: mañana
-    return datetime.now() + timedelta(days=1)
+    # Default: mañana (en hora Argentina)
+    return datetime.now(ARGENTINA_TZ).replace(tzinfo=None) + timedelta(days=1)
+
+
+def get_momento_disparo():
+    """
+    Calcula el datetime EXACTO en hora Argentina en el que la reserva debe habilitarse.
+    
+    Usa ONDEPOR_HORA_OBJETIVO (HH:MM) y opcionalmente ONDEPOR_FECHA_OBJETIVO (YYYY-MM-DD).
+    Si no hay hora objetivo, retorna None (= modo inmediato).
+    """
+    hora_env = os.environ.get("ONDEPOR_HORA_OBJETIVO", "").strip()
+    if not hora_env:
+        return None
+    
+    try:
+        hora, minuto = hora_env.split(":")
+        hora = int(hora)
+        minuto = int(minuto)
+    except (ValueError, IndexError):
+        print(f"⚠️ ONDEPOR_HORA_OBJETIVO inválida ('{hora_env}'), modo inmediato")
+        return None
+    
+    # Fecha del momento del disparo (no la fecha del turno)
+    fecha_disparo_env = os.environ.get("ONDEPOR_FECHA_OBJETIVO", "").strip()
+    if fecha_disparo_env:
+        try:
+            fecha_base = datetime.strptime(fecha_disparo_env, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"⚠️ ONDEPOR_FECHA_OBJETIVO inválida, usando hoy")
+            fecha_base = datetime.now(ARGENTINA_TZ).date()
+    else:
+        fecha_base = datetime.now(ARGENTINA_TZ).date()
+    
+    # Combinar fecha + hora en zona Argentina
+    momento = datetime.combine(
+        fecha_base,
+        datetime.min.time().replace(hour=hora, minute=minuto)
+    ).replace(tzinfo=ARGENTINA_TZ)
+    
+    return momento
+
+
+def esperar_hasta_momento_objetivo(momento_disparo):
+    """
+    Espera hasta START_MINUTES_BEFORE antes del momento_disparo.
+    Imprime el progreso cada minuto para que se vea en los logs de GitHub.
+    """
+    momento_inicio = momento_disparo - timedelta(minutes=START_MINUTES_BEFORE)
+    
+    ahora = datetime.now(ARGENTINA_TZ)
+    print(f"\n⏰ MODO PROGRAMADO ACTIVADO")
+    print(f"   🕐 Hora actual (ARG):       {ahora.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   🎯 Momento objetivo (ARG):  {momento_disparo.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   🚀 Empezar a intentar a:    {momento_inicio.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   ⏱️ Cortar intentos a:        {(momento_disparo + timedelta(minutes=END_MINUTES_AFTER)).strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    if ahora >= momento_inicio:
+        print(f"   ✅ Ya estamos dentro de la ventana, arrancamos ya")
+        return
+    
+    delta = (momento_inicio - ahora).total_seconds()
+    print(f"   💤 Esperando {int(delta)} segundos ({delta/60:.1f} min)...")
+    print(f"   📌 NOTA: el runner queda esperando, no apagar.\n")
+    
+    # Loop de espera con progreso cada minuto
+    while True:
+        ahora = datetime.now(ARGENTINA_TZ)
+        if ahora >= momento_inicio:
+            break
+        
+        restante = (momento_inicio - ahora).total_seconds()
+        if restante > 65:
+            # Dormimos en chunks de 60s para poder loggear
+            time.sleep(60)
+            ahora_post = datetime.now(ARGENTINA_TZ)
+            restante_post = (momento_inicio - ahora_post).total_seconds()
+            print(f"   ⏳ {ahora_post.strftime('%H:%M:%S')} — faltan {int(restante_post)}s ({restante_post/60:.1f} min)")
+        else:
+            # Última espera, precisa al segundo
+            print(f"   ⏳ Espera final de {int(restante)}s")
+            time.sleep(restante)
+            break
+    
+    ahora_final = datetime.now(ARGENTINA_TZ)
+    print(f"\n   ✅ ¡Arrancamos! Hora actual: {ahora_final.strftime('%H:%M:%S')}")
 
 
 # =============================================================================
@@ -137,12 +217,10 @@ def login(page, config):
     """Realiza el login en OnDepor."""
     print("🔐 Iniciando sesión...")
     
-    # Ir a la página principal
     page.goto(config["url"], timeout=config["timeout_navegacion"])
     page.wait_for_load_state("networkidle")
     time.sleep(2)
     
-    # Click en "Iniciar Sesión"
     try:
         page.click('text="INICIAR SESIÓN"', timeout=5000)
         time.sleep(2)
@@ -150,35 +228,25 @@ def login(page, config):
     except:
         pass
     
-    # Esperar a que aparezca el formulario de login
     try:
         page.wait_for_selector('#loginform-email', timeout=10000)
     except:
         print("   ❌ No se encontró el formulario de login")
         return False
     
-    # Completar credenciales con los IDs correctos
     try:
-        # Campo email
         page.fill('#loginform-email', config["usuario"])
         time.sleep(0.5)
-        
-        # Campo contraseña
         page.fill('#loginform-password', config["password"])
         time.sleep(0.5)
-        
-        # Click en INGRESAR
         page.click('#login')
-        
     except Exception as e:
         print(f"   ⚠️ Error en formulario: {e}")
         return False
     
-    # Esperar a que cargue
     page.wait_for_load_state("networkidle")
     time.sleep(3)
     
-    # Verificar login exitoso
     if page.locator('text="CERRAR SESIÓN"').count() > 0 or page.locator('text="Amir Prync"').count() > 0:
         print("✅ Login exitoso")
         return True
@@ -192,16 +260,14 @@ def login(page, config):
 # =============================================================================
 
 def ir_a_actividad(page, config):
-    """Navega a la sección de la actividad configurada (PÁDEL DIURNO o NOCTURNO)."""
+    """Navega a la sección de la actividad configurada."""
     actividad = config["actividad"]
     print(f"\n📍 Navegando a {actividad}...")
     
-    # Ir a favoritos/clubes
     page.goto(config["url_favoritos"], timeout=config["timeout_navegacion"])
     page.wait_for_load_state("networkidle")
     time.sleep(3)
     
-    # Click en CLUBES si es necesario
     try:
         page.click('text="CLUBES"', timeout=3000)
         time.sleep(2)
@@ -209,7 +275,6 @@ def ir_a_actividad(page, config):
     except:
         pass
     
-    # Buscar y clickear en la actividad
     try:
         selectores = [
             f'h4:has-text("{actividad}")',
@@ -273,9 +338,6 @@ def navegar_a_dia(page, dia_objetivo):
 
 def buscar_horario_disponible(page, config, fecha_objetivo):
     """Busca un horario disponible según las preferencias PARA EL DÍA CORRECTO."""
-    
-    # Calcular el timestamp Unix para el día objetivo (a las 00:00)
-    # El timestamp en el data-id representa la fecha/hora del turno
     fecha_inicio_dia = fecha_objetivo.replace(hour=0, minute=0, second=0, microsecond=0)
     fecha_fin_dia = fecha_objetivo.replace(hour=23, minute=59, second=59, microsecond=0)
     
@@ -283,7 +345,6 @@ def buscar_horario_disponible(page, config, fecha_objetivo):
     timestamp_fin = int(fecha_fin_dia.timestamp())
     
     print(f"   📅 Buscando para fecha: {fecha_objetivo.strftime('%d/%m/%Y')}")
-    print(f"   🔢 Rango timestamps: {timestamp_inicio} - {timestamp_fin}")
     
     for horario in config["horarios_preferidos"]:
         print(f"   Buscando horario {horario}...")
@@ -299,20 +360,15 @@ def buscar_horario_disponible(page, config, fecha_objetivo):
                 if "disabled" in clase:
                     continue
                 
-                # Extraer el timestamp del data-id
-                # Formato: time-HH:MM-club-CLUBID-TIMESTAMP
                 partes = data_id.split("-")
                 if len(partes) >= 5:
                     try:
                         timestamp_celda = int(partes[-1])
-                        
-                        # Verificar si el timestamp corresponde al día objetivo
                         if timestamp_inicio <= timestamp_celda <= timestamp_fin:
                             if "libres" in texto.lower() or texto.strip().isdigit():
                                 print(f"   ✅ Encontrado: {horario} (timestamp: {timestamp_celda})")
                                 return celda, horario
                         else:
-                            # Es de otro día, ignorar
                             continue
                     except ValueError:
                         continue
@@ -326,7 +382,6 @@ def buscar_horario_disponible(page, config, fecha_objetivo):
 def refrescar_calendario(page, config):
     """Refresca el calendario para ver nuevos horarios disponibles."""
     try:
-        # Refrescar la página actual
         page.reload()
         page.wait_for_load_state("networkidle")
         time.sleep(1)
@@ -375,11 +430,9 @@ def agregar_socios(page, config):
     for socio in config["socios"]:
         try:
             print(f"      Agregando: {socio}")
-            
             input_socios.fill("")
             time.sleep(0.3)
-            input_socios.type(socio, delay=50)  # Más rápido
-            
+            input_socios.type(socio, delay=50)
             time.sleep(1)
             
             try:
@@ -403,11 +456,9 @@ def aceptar_terminos(page):
     
     try:
         checkbox = page.locator('#reservationform-terms_and_cond')
-        
         if not checkbox.is_checked():
             checkbox.click()
             time.sleep(0.3)
-        
         print("   ✅ Términos aceptados")
         return True
     except Exception as e:
@@ -417,7 +468,6 @@ def aceptar_terminos(page):
 
 def verificar_errores(page):
     """Verifica si hay mensajes de error en el modal."""
-    
     errores = page.locator('.alert-danger, .alert-warning, [class*="error"], [style*="background"][style*="rgb(23"]').all()
     
     for error in errores:
@@ -477,12 +527,10 @@ def confirmar_reserva(page, dry_run=False):
 def cerrar_modal(page):
     """Cierra el modal de reserva si está abierto."""
     try:
-        # Intentar cerrar con el botón X o CERRAR
         page.click('button[data-dismiss="modal"], .close, text="CERRAR"', timeout=2000)
         time.sleep(1)
     except:
         try:
-            # Presionar Escape
             page.keyboard.press("Escape")
             time.sleep(1)
         except:
@@ -525,32 +573,51 @@ def realizar_reserva(page, config, celda_horario, horario, dry_run=False):
 # SISTEMA DE REINTENTOS
 # =============================================================================
 
-def intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run=False):
+def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_disparo, dry_run=False):
     """
     Intenta hacer la reserva con reintentos.
     
-    El sistema:
-    1. Busca horarios disponibles
-    2. Si no hay, espera RETRY_INTERVAL_SECONDS y refresca
-    3. Repite hasta conseguir o timeout
+    - Si momento_disparo está definido (modo programado):
+      sigue intentando hasta momento_disparo + END_MINUTES_AFTER
+    - Si no (modo inmediato):
+      sigue intentando hasta MAX_RETRY_MINUTES_INMEDIATO desde ahora
     """
     
-    tiempo_inicio = datetime.now()
-    tiempo_maximo = tiempo_inicio + timedelta(minutes=MAX_RETRY_MINUTES)
+    if momento_disparo is not None:
+        # Modo programado: ventana fija atada al momento objetivo
+        tiempo_maximo_arg = momento_disparo + timedelta(minutes=END_MINUTES_AFTER)
+        # Convertimos a naive para comparar con datetime.now() sin tz
+        tiempo_maximo = tiempo_maximo_arg.astimezone(ARGENTINA_TZ).replace(tzinfo=None)
+        # Usamos hora Argentina como referencia
+        def ahora_ref():
+            return datetime.now(ARGENTINA_TZ).replace(tzinfo=None)
+        modo = "PROGRAMADO"
+    else:
+        # Modo inmediato: ventana relativa al inicio
+        tiempo_maximo = datetime.now() + timedelta(minutes=MAX_RETRY_MINUTES_INMEDIATO)
+        def ahora_ref():
+            return datetime.now()
+        modo = "INMEDIATO"
+    
     intento = 0
     
-    print(f"\n🔄 SISTEMA DE REINTENTOS ACTIVADO")
+    print(f"\n🔄 SISTEMA DE REINTENTOS ACTIVADO ({modo})")
     print(f"   ⏰ Intervalo entre intentos: {RETRY_INTERVAL_SECONDS} segundos")
-    print(f"   ⏱️ Timeout máximo: {MAX_RETRY_MINUTES} minutos")
+    if momento_disparo is not None:
+        ventana_total = (END_MINUTES_AFTER + START_MINUTES_BEFORE)
+        print(f"   ⏱️ Ventana total: {ventana_total} min ({START_MINUTES_BEFORE} antes + {END_MINUTES_AFTER} después)")
+        print(f"   🛑 Cortar a las: {tiempo_maximo.strftime('%H:%M:%S')} (ARG)")
+    else:
+        print(f"   ⏱️ Timeout máximo: {MAX_RETRY_MINUTES_INMEDIATO} minutos")
     print(f"   🎯 Horarios buscados: {config['horarios_preferidos']}")
     print("="*50)
     
-    while datetime.now() < tiempo_maximo:
+    while ahora_ref() < tiempo_maximo:
         intento += 1
-        ahora = datetime.now()
-        tiempo_transcurrido = (ahora - tiempo_inicio).seconds
+        ahora = ahora_ref()
+        restante = (tiempo_maximo - ahora).total_seconds()
         
-        print(f"\n🔄 Intento #{intento} [{ahora.strftime('%H:%M:%S')}] (transcurrido: {tiempo_transcurrido}s)")
+        print(f"\n🔄 Intento #{intento} [{ahora.strftime('%H:%M:%S')}] (restan: {int(restante)}s)")
         
         # Buscar horario disponible
         print("   🔍 Buscando horarios disponibles...")
@@ -558,8 +625,6 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run=False)
         
         if celda is not None:
             print(f"   ✅ ¡HORARIO ENCONTRADO! {horario}")
-            
-            # Intentar hacer la reserva
             if realizar_reserva(page, config, celda, horario, dry_run):
                 return True
             else:
@@ -568,18 +633,18 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run=False)
         else:
             print(f"   ⏳ No hay horarios disponibles aún...")
         
-        # Esperar antes del siguiente intento
-        print(f"   ⏰ Esperando {RETRY_INTERVAL_SECONDS} segundos...")
+        # Si ya nos pasamos del corte, salir
+        if ahora_ref() >= tiempo_maximo:
+            break
+        
+        print(f"   ⏰ Esperando {RETRY_INTERVAL_SECONDS}s...")
         time.sleep(RETRY_INTERVAL_SECONDS)
         
-        # Refrescar el calendario
         print("   🔄 Refrescando calendario...")
         refrescar_calendario(page, config)
-        
-        # Re-navegar al día si es necesario
         navegar_a_dia(page, fecha_objetivo)
     
-    print(f"\n❌ TIMEOUT: Se agotaron los {MAX_RETRY_MINUTES} minutos de intentos")
+    print(f"\n❌ TIMEOUT: Se agotó la ventana de intentos ({tiempo_maximo.strftime('%H:%M:%S')})")
     return False
 
 
@@ -590,24 +655,42 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run=False)
 def ejecutar_bot(visible=False, dry_run=False):
     """Función principal del bot."""
     config = get_config()
+    fecha_objetivo = get_fecha_objetivo()
+    momento_disparo = get_momento_disparo()
     
     print("\n" + "="*60)
     print("🎾 ONDEPOR - BOT DE RESERVA DE PÁDEL")
     print("="*60)
-    print(f"📅 Fecha ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    ahora_arg = datetime.now(ARGENTINA_TZ)
+    print(f"📅 Hora ejecución (ARG): {ahora_arg.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"👤 Usuario: {config['usuario']}")
     print(f"🎯 Actividad: {config['actividad']}")
+    print(f"📆 Día a reservar: {fecha_objetivo.strftime('%A %d/%m/%Y')}")
     print(f"⏰ Horarios preferidos: {config['horarios_preferidos']}")
     print(f"👥 Socios: {', '.join(config['socios'])}")
-    print(f"🔄 Sistema de reintentos: Cada {RETRY_INTERVAL_SECONDS}s por {MAX_RETRY_MINUTES} min")
+    if momento_disparo is not None:
+        print(f"🚨 MODO PROGRAMADO: dispara a las {momento_disparo.strftime('%H:%M')} (ARG)")
+        print(f"   → Empieza a intentar a las {(momento_disparo - timedelta(minutes=START_MINUTES_BEFORE)).strftime('%H:%M:%S')}")
+        print(f"   → Corta intentos a las   {(momento_disparo + timedelta(minutes=END_MINUTES_AFTER)).strftime('%H:%M:%S')}")
+    else:
+        print(f"⚡ MODO INMEDIATO: arranca ya")
     if dry_run:
         print("⚠️  MODO DRY-RUN: No se harán reservas reales")
     print("="*60)
     
-    # Calcular fecha objetivo
-    fecha_objetivo = get_fecha_objetivo()
-    print(f"\n📆 Fecha a reservar: {fecha_objetivo.strftime('%A %d/%m/%Y')}")
+    # FASE 1: ESPERAR (si modo programado)
+    # Hacemos esto ANTES de levantar el browser para no tener Chromium prendido al pedo
+    if momento_disparo is not None:
+        # Validar que no estemos demasiado tarde
+        ahora = datetime.now(ARGENTINA_TZ)
+        limite = momento_disparo + timedelta(minutes=END_MINUTES_AFTER)
+        if ahora >= limite:
+            print(f"\n❌ Ya pasó la ventana objetivo (límite {limite.strftime('%H:%M:%S')}). Abortando.")
+            sys.exit(1)
+        
+        esperar_hasta_momento_objetivo(momento_disparo)
     
+    # FASE 2: LEVANTAR BROWSER Y EJECUTAR
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=not visible,
@@ -623,21 +706,17 @@ def ejecutar_bot(visible=False, dry_run=False):
         page.set_default_timeout(config["timeout_elemento"])
         
         try:
-            # Login
             if not login(page, config):
                 print("\n❌ Login fallido. Abortando.")
                 sys.exit(1)
             
-            # Navegar a la actividad (DIURNO o NOCTURNO)
             if not ir_a_actividad(page, config):
                 print(f"\n❌ No se pudo acceder a {config['actividad']}. Abortando.")
                 sys.exit(1)
             
-            # Navegar al día objetivo
             navegar_a_dia(page, fecha_objetivo)
             
-            # Intentar reserva con reintentos
-            if intentar_reserva_con_reintentos(page, config, fecha_objetivo, dry_run):
+            if intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_disparo, dry_run):
                 print("\n" + "="*60)
                 print("✅ RESERVA COMPLETADA EXITOSAMENTE")
                 print("="*60)
