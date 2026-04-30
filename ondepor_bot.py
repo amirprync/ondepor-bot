@@ -9,9 +9,17 @@ SISTEMA DE REINTENTOS:
 - Timeout máximo de 10 minutos
 
 Variables de entorno requeridas:
-    ONDEPOR_USER: Email de login
-    ONDEPOR_PASS: Contraseña
-    ONDEPOR_SOCIOS: (opcional) Lista de socios separados por coma
+    ONDEPOR_USER:       Email de login
+    ONDEPOR_PASS:       Contraseña
+
+Variables de entorno opcionales (configurables desde la web):
+    ONDEPOR_SOCIOS:     Lista de socios separados por coma
+                        Ej: "Alan Garbo,Gabriel Topor,Damian Potap"
+    ONDEPOR_HORARIOS:   Horarios preferidos en orden de prioridad
+                        Ej: "10:00,09:00"
+    ONDEPOR_FECHA:      Fecha objetivo en formato YYYY-MM-DD
+                        Si no se indica, usa mañana (default)
+    ONDEPOR_ACTIVIDAD:  "DIURNO" o "NOCTURNO" (default: DIURNO)
 
 Uso:
     python ondepor_bot.py
@@ -51,7 +59,7 @@ def get_config():
     # Formato: "Alan Garbo,Gabriel Topor,Damian Potap"
     socios_env = os.environ.get("ONDEPOR_SOCIOS", "")
     if socios_env:
-        socios = [s.strip() for s in socios_env.split(",")]
+        socios = [s.strip() for s in socios_env.split(",") if s.strip()]
     else:
         # Socios por defecto
         socios = [
@@ -59,6 +67,20 @@ def get_config():
             "Gabriel Topor",
             "Damian Potap"
         ]
+    
+    # Horarios preferidos (configurable desde variable de entorno)
+    # Formato: "10:00,09:00"
+    horarios_env = os.environ.get("ONDEPOR_HORARIOS", "")
+    if horarios_env:
+        horarios_preferidos = [h.strip() for h in horarios_env.split(",") if h.strip()]
+    else:
+        horarios_preferidos = ["09:00", "10:00"]
+    
+    # Actividad: DIURNO o NOCTURNO
+    actividad_env = os.environ.get("ONDEPOR_ACTIVIDAD", "DIURNO").upper().strip()
+    if actividad_env not in ("DIURNO", "NOCTURNO"):
+        actividad_env = "DIURNO"
+    actividad = f"PÁDEL {actividad_env}"
     
     return {
         "url": "https://www.ondepor.com/",
@@ -68,8 +90,8 @@ def get_config():
         "password": password,
         
         # Preferencias de reserva
-        "actividad": "PÁDEL DIURNO",  # o "PÁDEL NOCTURNO"
-        "horarios_preferidos": ["09:00", "10:00"],  # En orden de prioridad
+        "actividad": actividad,
+        "horarios_preferidos": horarios_preferidos,
         
         # Canchas preferidas (en orden de prioridad)
         # Las KINERET son las canchas 05-08
@@ -83,6 +105,28 @@ def get_config():
         "timeout_elemento": 10000,
         "delay_entre_acciones": 1000,  # Reducido para ser más rápido
     }
+
+
+def get_fecha_objetivo():
+    """
+    Calcula la fecha a reservar.
+    
+    Si está la variable ONDEPOR_FECHA con formato YYYY-MM-DD, la usa.
+    Caso contrario, usa mañana (comportamiento original).
+    """
+    fecha_env = os.environ.get("ONDEPOR_FECHA", "").strip()
+    if fecha_env:
+        try:
+            fecha = datetime.strptime(fecha_env, "%Y-%m-%d")
+            # Le ponemos hora 12 del mediodía para evitar problemas con timezone
+            fecha = fecha.replace(hour=12, minute=0, second=0, microsecond=0)
+            print(f"📅 Usando fecha desde ONDEPOR_FECHA: {fecha.strftime('%d/%m/%Y')}")
+            return fecha
+        except ValueError:
+            print(f"⚠️ ONDEPOR_FECHA inválida ('{fecha_env}'), usando mañana por defecto")
+    
+    # Default: mañana
+    return datetime.now() + timedelta(days=1)
 
 
 # =============================================================================
@@ -147,9 +191,10 @@ def login(page, config):
 # FUNCIONES DE NAVEGACIÓN
 # =============================================================================
 
-def ir_a_padel_diurno(page, config):
-    """Navega a la sección de PÁDEL DIURNO."""
-    print("\n📍 Navegando a PÁDEL DIURNO...")
+def ir_a_actividad(page, config):
+    """Navega a la sección de la actividad configurada (PÁDEL DIURNO o NOCTURNO)."""
+    actividad = config["actividad"]
+    print(f"\n📍 Navegando a {actividad}...")
     
     # Ir a favoritos/clubes
     page.goto(config["url_favoritos"], timeout=config["timeout_navegacion"])
@@ -164,13 +209,13 @@ def ir_a_padel_diurno(page, config):
     except:
         pass
     
-    # Buscar y clickear en PÁDEL DIURNO
+    # Buscar y clickear en la actividad
     try:
         selectores = [
-            'h4:has-text("PÁDEL DIURNO")',
-            'div[id*="club_id"]:has-text("PÁDEL DIURNO")',
-            'div.open_calendar_board:has-text("PÁDEL DIURNO")',
-            'text="CISSAB | PÁDEL DIURNO"',
+            f'h4:has-text("{actividad}")',
+            f'div[id*="club_id"]:has-text("{actividad}")',
+            f'div.open_calendar_board:has-text("{actividad}")',
+            f'text="CISSAB | {actividad}"',
         ]
         
         for selector in selectores:
@@ -180,12 +225,12 @@ def ir_a_padel_diurno(page, config):
                     elemento.click()
                     time.sleep(2)
                     page.wait_for_load_state("networkidle")
-                    print("✅ En sección PÁDEL DIURNO")
+                    print(f"✅ En sección {actividad}")
                     return True
             except:
                 continue
         
-        print("❌ No se encontró PÁDEL DIURNO")
+        print(f"❌ No se encontró {actividad}")
         return False
         
     except Exception as e:
@@ -559,8 +604,8 @@ def ejecutar_bot(visible=False, dry_run=False):
         print("⚠️  MODO DRY-RUN: No se harán reservas reales")
     print("="*60)
     
-    # Calcular fecha objetivo (mañana, ya que el bot corre 24hs antes)
-    fecha_objetivo = datetime.now() + timedelta(days=1)
+    # Calcular fecha objetivo
+    fecha_objetivo = get_fecha_objetivo()
     print(f"\n📆 Fecha a reservar: {fecha_objetivo.strftime('%A %d/%m/%Y')}")
     
     with sync_playwright() as p:
@@ -583,9 +628,9 @@ def ejecutar_bot(visible=False, dry_run=False):
                 print("\n❌ Login fallido. Abortando.")
                 sys.exit(1)
             
-            # Navegar a PÁDEL DIURNO
-            if not ir_a_padel_diurno(page, config):
-                print("\n❌ No se pudo acceder a PÁDEL DIURNO. Abortando.")
+            # Navegar a la actividad (DIURNO o NOCTURNO)
+            if not ir_a_actividad(page, config):
+                print(f"\n❌ No se pudo acceder a {config['actividad']}. Abortando.")
                 sys.exit(1)
             
             # Navegar al día objetivo
