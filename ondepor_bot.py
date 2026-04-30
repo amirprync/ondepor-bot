@@ -4,15 +4,19 @@ OnDepor - Bot de Reserva Automática de Canchas de Pádel
 Automatiza la reserva de canchas en CISSAB a través de ondepor.com
 
 MODOS DE EJECUCIÓN:
-1. Inmediato: El bot arranca a intentar la reserva apenas se ejecuta
-2. Programado: Si se define ONDEPOR_HORA_OBJETIVO, espera hasta
-   (hora_objetivo - 2 min) y recién ahí empieza a intentar.
-   Sigue intentando hasta 5 min DESPUÉS de la hora objetivo.
+1. Inmediato: El bot arranca a buscar la reserva apenas se ejecuta
+2. Programado: Si se define ONDEPOR_HORA_OBJETIVO, sigue esta línea de tiempo:
 
-VENTANA DE INTENTOS (modo programado):
-- Inicio: hora_objetivo - 2 min  (START_MINUTES_BEFORE)
-- Fin:    hora_objetivo + 5 min  (END_MINUTES_AFTER)
-- Total:  7 min de intentos cada RETRY_INTERVAL_SECONDS
+    t - 2 min        →  💤 Pre-carga: levanta browser, login, navega al día
+                        (cuando termina, queda esperando)
+    t - 5 segundos   →  🔍 Empieza a refrescar agresivamente (cada 0.5s)
+    t (ej. 16:00:00) →  🎯 El club habilita la celda, click instantáneo
+    t + 60 segundos  →  📉 Si no consiguió, baja a polling normal (cada 3s)
+    t + 5 min        →  🛑 Abandona
+
+OBJETIVO: estar logueado y posicionado en el calendario antes de la hora exacta,
+para reaccionar inmediatamente cuando el club habilita el turno y competir
+contra otros usuarios que también están intentando reservar.
 
 Variables de entorno requeridas:
     ONDEPOR_USER:           Email de login
@@ -20,19 +24,12 @@ Variables de entorno requeridas:
 
 Variables de entorno opcionales (configurables desde la web):
     ONDEPOR_SOCIOS:         Lista de socios separados por coma
-                            Ej: "Alan Garbo,Gabriel Topor,Damian Potap"
     ONDEPOR_HORARIOS:       Horarios preferidos en orden de prioridad
-                            Ej: "10:00,09:00"
-    ONDEPOR_FECHA:          Fecha objetivo en formato YYYY-MM-DD
-                            Si no se indica, usa mañana (default)
+    ONDEPOR_FECHA:          Fecha del turno YYYY-MM-DD (default: mañana)
     ONDEPOR_ACTIVIDAD:      "DIURNO" o "NOCTURNO" (default: DIURNO)
-    ONDEPOR_HORA_OBJETIVO:  Hora local Argentina HH:MM en la que el sistema
-                            habilita la reserva. El bot esperará hasta
-                            (esa hora - 2 min) antes de empezar a intentar.
-                            Si no se indica, ejecuta inmediato (modo viejo).
-    ONDEPOR_FECHA_OBJETIVO: Fecha (YYYY-MM-DD) para el momento exacto del
-                            disparo. Solo se usa junto con ONDEPOR_HORA_OBJETIVO.
-                            Si no se indica, asume hoy.
+    ONDEPOR_HORA_OBJETIVO:  Hora ARG HH:MM en la que el club habilita.
+                            Si no se indica, ejecuta inmediato.
+    ONDEPOR_FECHA_OBJETIVO: Fecha del momento del disparo YYYY-MM-DD (default: hoy)
 
 Uso:
     python ondepor_bot.py
@@ -52,10 +49,25 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # CONFIGURACIÓN
 # =============================================================================
 
-# Configuración del sistema de reintentos
-RETRY_INTERVAL_SECONDS = 3      # Intentar cada 3 segundos
-START_MINUTES_BEFORE = 2        # Arrancar 2 min antes de la hora objetivo
-END_MINUTES_AFTER = 5           # Cortar 5 min después de la hora objetivo
+# =============================================================================
+# Configuración de tiempos del modo PROGRAMADO
+# =============================================================================
+# Línea de tiempo:
+#
+#   t - PRELOAD_MINUTES_BEFORE       →  Levanta browser, login, navega al día
+#   t - INICIO_BUSQUEDA_SEG_ANTES    →  Empieza a refrescar agresivamente
+#   t (hora objetivo, ej. 16:00)     →  El club habilita la celda
+#   t + END_MINUTES_AFTER            →  Abandona si no consiguió
+#
+
+PRELOAD_MINUTES_BEFORE = 2          # Pre-carga (login + navegación) antes de la hora
+INICIO_BUSQUEDA_SEG_ANTES = 5       # Empezar a refrescar X segundos antes de la hora exacta
+END_MINUTES_AFTER = 5               # Cortar intentos X min después de la hora objetivo
+
+RETRY_INTERVAL_RAPIDO = 0.5         # Intervalo durante ventana crítica
+RETRY_INTERVAL_NORMAL = 3.0         # Intervalo después de la ventana crítica
+VENTANA_CRITICA_DESPUES_SEG = 60    # Cuántos seg después de t seguir con polling rápido
+
 # Modo inmediato (sin hora objetivo): ventana max de intentos
 MAX_RETRY_MINUTES_INMEDIATO = 15
 
@@ -164,49 +176,47 @@ def get_momento_disparo():
     return momento
 
 
-def esperar_hasta_momento_objetivo(momento_disparo):
+def esperar_hasta(momento_target, etiqueta="momento objetivo"):
     """
-    Espera hasta START_MINUTES_BEFORE antes del momento_disparo.
-    Imprime el progreso cada minuto para que se vea en los logs de GitHub.
+    Helper genérico para dormir hasta un datetime específico (en zona ARG).
+    Imprime progreso cada 60s mientras espera.
     """
-    momento_inicio = momento_disparo - timedelta(minutes=START_MINUTES_BEFORE)
+    while True:
+        ahora = datetime.now(ARGENTINA_TZ)
+        if ahora >= momento_target:
+            return
+        
+        restante = (momento_target - ahora).total_seconds()
+        
+        if restante > 65:
+            # Dormir en chunks de 60s para poder loggear progreso
+            time.sleep(60)
+            nuevo = datetime.now(ARGENTINA_TZ)
+            r2 = (momento_target - nuevo).total_seconds()
+            if r2 > 0:
+                print(f"   ⏳ {nuevo.strftime('%H:%M:%S')} — faltan {int(r2)}s ({r2/60:.1f} min) hasta {etiqueta}")
+        elif restante > 1:
+            # Espera precisa para los últimos segundos
+            time.sleep(restante - 0.5)
+        else:
+            # Espera final precisa
+            time.sleep(max(0, restante))
+            return
+
+
+def imprimir_plan_programado(momento_disparo):
+    """Imprime el plan de ejecución del modo programado."""
+    momento_preload = momento_disparo - timedelta(minutes=PRELOAD_MINUTES_BEFORE)
+    momento_busqueda = momento_disparo - timedelta(seconds=INICIO_BUSQUEDA_SEG_ANTES)
+    momento_corte = momento_disparo + timedelta(minutes=END_MINUTES_AFTER)
     
     ahora = datetime.now(ARGENTINA_TZ)
     print(f"\n⏰ MODO PROGRAMADO ACTIVADO")
-    print(f"   🕐 Hora actual (ARG):       {ahora.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   🎯 Momento objetivo (ARG):  {momento_disparo.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   🚀 Empezar a intentar a:    {momento_inicio.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   ⏱️ Cortar intentos a:        {(momento_disparo + timedelta(minutes=END_MINUTES_AFTER)).strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    if ahora >= momento_inicio:
-        print(f"   ✅ Ya estamos dentro de la ventana, arrancamos ya")
-        return
-    
-    delta = (momento_inicio - ahora).total_seconds()
-    print(f"   💤 Esperando {int(delta)} segundos ({delta/60:.1f} min)...")
-    print(f"   📌 NOTA: el runner queda esperando, no apagar.\n")
-    
-    # Loop de espera con progreso cada minuto
-    while True:
-        ahora = datetime.now(ARGENTINA_TZ)
-        if ahora >= momento_inicio:
-            break
-        
-        restante = (momento_inicio - ahora).total_seconds()
-        if restante > 65:
-            # Dormimos en chunks de 60s para poder loggear
-            time.sleep(60)
-            ahora_post = datetime.now(ARGENTINA_TZ)
-            restante_post = (momento_inicio - ahora_post).total_seconds()
-            print(f"   ⏳ {ahora_post.strftime('%H:%M:%S')} — faltan {int(restante_post)}s ({restante_post/60:.1f} min)")
-        else:
-            # Última espera, precisa al segundo
-            print(f"   ⏳ Espera final de {int(restante)}s")
-            time.sleep(restante)
-            break
-    
-    ahora_final = datetime.now(ARGENTINA_TZ)
-    print(f"\n   ✅ ¡Arrancamos! Hora actual: {ahora_final.strftime('%H:%M:%S')}")
+    print(f"   🕐 Hora actual (ARG):           {ahora.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   🎯 Hora objetivo (habilita):    {momento_disparo.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   📥 Pre-carga (login + nav):     {momento_preload.strftime('%H:%M:%S')}")
+    print(f"   🔍 Empezar a buscar:            {momento_busqueda.strftime('%H:%M:%S')} ({INICIO_BUSQUEDA_SEG_ANTES}s antes)")
+    print(f"   🛑 Cortar si no consigue:       {momento_corte.strftime('%H:%M:%S')}")
 
 
 # =============================================================================
@@ -336,51 +346,81 @@ def navegar_a_dia(page, dia_objetivo):
 # FUNCIONES DE RESERVA
 # =============================================================================
 
-def buscar_horario_disponible(page, config, fecha_objetivo):
-    """Busca un horario disponible según las preferencias PARA EL DÍA CORRECTO."""
+def buscar_horario_disponible(page, config, fecha_objetivo, verbose=False):
+    """
+    Busca un horario disponible PARA EL DÍA CORRECTO.
+    Retorna (locator_celda, horario_str) o (None, None).
+    
+    Importante: NO filtra por :not(.disabled) en el selector porque queremos
+    detectar la celda apenas pase a libre, sin tener que esperar al próximo refresco.
+    """
     fecha_inicio_dia = fecha_objetivo.replace(hour=0, minute=0, second=0, microsecond=0)
     fecha_fin_dia = fecha_objetivo.replace(hour=23, minute=59, second=59, microsecond=0)
     
     timestamp_inicio = int(fecha_inicio_dia.timestamp())
     timestamp_fin = int(fecha_fin_dia.timestamp())
     
-    print(f"   📅 Buscando para fecha: {fecha_objetivo.strftime('%d/%m/%Y')}")
+    if verbose:
+        print(f"   📅 Buscando para fecha: {fecha_objetivo.strftime('%d/%m/%Y')}")
     
     for horario in config["horarios_preferidos"]:
-        print(f"   Buscando horario {horario}...")
-        selector = f'td[data-id*="time-{horario}"]:not(.disabled)'
+        # Selector SIN :not(.disabled) — para que detecte la celda apenas se libere
+        selector = f'td[data-id*="time-{horario}"]'
         celdas = page.locator(selector).all()
         
         for celda in celdas:
             try:
-                texto = celda.inner_text()
-                clase = celda.get_attribute("class") or ""
                 data_id = celda.get_attribute("data-id") or ""
                 
-                if "disabled" in clase:
+                # Filtrar por timestamp del día objetivo
+                partes = data_id.split("-")
+                if len(partes) < 5:
+                    continue
+                try:
+                    timestamp_celda = int(partes[-1])
+                except ValueError:
+                    continue
+                if not (timestamp_inicio <= timestamp_celda <= timestamp_fin):
                     continue
                 
-                partes = data_id.split("-")
-                if len(partes) >= 5:
-                    try:
-                        timestamp_celda = int(partes[-1])
-                        if timestamp_inicio <= timestamp_celda <= timestamp_fin:
-                            if "libres" in texto.lower() or texto.strip().isdigit():
-                                print(f"   ✅ Encontrado: {horario} (timestamp: {timestamp_celda})")
-                                return celda, horario
-                        else:
-                            continue
-                    except ValueError:
-                        continue
+                # Acá ya sabemos que es del día correcto. Verificar si está libre.
+                clase = celda.get_attribute("class") or ""
+                if "disabled" in clase:
+                    if verbose:
+                        print(f"   🔒 {horario} todavía deshabilitada")
+                    continue  # Sigue buscando otros horarios o celdas
+                
+                texto = celda.inner_text()
+                if "libres" in texto.lower() or texto.strip().isdigit():
+                    print(f"   ✅ ¡LIBRE! {horario} (timestamp: {timestamp_celda})")
+                    return celda, horario
+                else:
+                    if verbose:
+                        print(f"   ⚠️ {horario} habilitada pero sin lugares ('{texto.strip()[:30]}')")
                     
-            except Exception as e:
+            except Exception:
                 continue
     
     return None, None
 
 
+def refrescar_calendario_rapido(page, config, fecha_objetivo):
+    """
+    Refresco AGRESIVO usado en la ventana crítica (cerca de la hora exacta).
+    NO espera networkidle (eso tarda 1-2s extras). Solo recarga rápido.
+    """
+    try:
+        # Navegar al día objetivo de nuevo (igual de rápido que reload pero más confiable
+        # porque no pierde el estado del calendario)
+        page.reload(wait_until="domcontentloaded", timeout=8000)
+        # Esperamos solo a que el DOM esté disponible, no a networkidle
+        return True
+    except Exception as e:
+        return False
+
+
 def refrescar_calendario(page, config):
-    """Refresca el calendario para ver nuevos horarios disponibles."""
+    """Refresco normal usado fuera de la ventana crítica."""
     try:
         page.reload()
         page.wait_for_load_state("networkidle")
@@ -575,38 +615,49 @@ def realizar_reserva(page, config, celda_horario, horario, dry_run=False):
 
 def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_disparo, dry_run=False):
     """
-    Intenta hacer la reserva con reintentos.
+    Intenta hacer la reserva con polling adaptativo.
     
-    - Si momento_disparo está definido (modo programado):
-      sigue intentando hasta momento_disparo + END_MINUTES_AFTER
-    - Si no (modo inmediato):
-      sigue intentando hasta MAX_RETRY_MINUTES_INMEDIATO desde ahora
+    Modo programado:
+        - Refresca rápido (cada RETRY_INTERVAL_RAPIDO seg) durante la ventana crítica:
+          desde t-INICIO_BUSQUEDA_SEG_ANTES hasta t+VENTANA_CRITICA_DESPUES_SEG
+        - Refresca normal (cada RETRY_INTERVAL_NORMAL seg) después
+        - Corta a t+END_MINUTES_AFTER
+    
+    Modo inmediato:
+        - Refresca siempre con intervalo normal hasta MAX_RETRY_MINUTES_INMEDIATO
     """
     
     if momento_disparo is not None:
-        # Modo programado: ventana fija atada al momento objetivo
-        tiempo_maximo_arg = momento_disparo + timedelta(minutes=END_MINUTES_AFTER)
-        # Convertimos a naive para comparar con datetime.now() sin tz
-        tiempo_maximo = tiempo_maximo_arg.astimezone(ARGENTINA_TZ).replace(tzinfo=None)
-        # Usamos hora Argentina como referencia
+        # Modo programado
+        momento_disparo_naive = momento_disparo.astimezone(ARGENTINA_TZ).replace(tzinfo=None)
+        ventana_critica_fin = momento_disparo_naive + timedelta(seconds=VENTANA_CRITICA_DESPUES_SEG)
+        tiempo_maximo = momento_disparo_naive + timedelta(minutes=END_MINUTES_AFTER)
+        
         def ahora_ref():
             return datetime.now(ARGENTINA_TZ).replace(tzinfo=None)
+        
         modo = "PROGRAMADO"
     else:
-        # Modo inmediato: ventana relativa al inicio
+        # Modo inmediato
         tiempo_maximo = datetime.now() + timedelta(minutes=MAX_RETRY_MINUTES_INMEDIATO)
+        ventana_critica_fin = None
+        momento_disparo_naive = None
+        
         def ahora_ref():
             return datetime.now()
+        
         modo = "INMEDIATO"
     
     intento = 0
+    en_ventana_critica = False
+    ultimo_log = datetime.min
     
-    print(f"\n🔄 SISTEMA DE REINTENTOS ACTIVADO ({modo})")
-    print(f"   ⏰ Intervalo entre intentos: {RETRY_INTERVAL_SECONDS} segundos")
+    print(f"\n🔄 BÚSQUEDA DE RESERVA ACTIVADA ({modo})")
     if momento_disparo is not None:
-        ventana_total = (END_MINUTES_AFTER + START_MINUTES_BEFORE)
-        print(f"   ⏱️ Ventana total: {ventana_total} min ({START_MINUTES_BEFORE} antes + {END_MINUTES_AFTER} después)")
-        print(f"   🛑 Cortar a las: {tiempo_maximo.strftime('%H:%M:%S')} (ARG)")
+        print(f"   🎯 Hora objetivo: {momento_disparo_naive.strftime('%H:%M:%S')}")
+        print(f"   ⚡ Ventana crítica (polling cada {RETRY_INTERVAL_RAPIDO}s): hasta {ventana_critica_fin.strftime('%H:%M:%S')}")
+        print(f"   🐢 Después polling cada {RETRY_INTERVAL_NORMAL}s")
+        print(f"   🛑 Cortar a las: {tiempo_maximo.strftime('%H:%M:%S')}")
     else:
         print(f"   ⏱️ Timeout máximo: {MAX_RETRY_MINUTES_INMEDIATO} minutos")
     print(f"   🎯 Horarios buscados: {config['horarios_preferidos']}")
@@ -615,36 +666,59 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
     while ahora_ref() < tiempo_maximo:
         intento += 1
         ahora = ahora_ref()
-        restante = (tiempo_maximo - ahora).total_seconds()
         
-        print(f"\n🔄 Intento #{intento} [{ahora.strftime('%H:%M:%S')}] (restan: {int(restante)}s)")
+        # ¿Estamos en ventana crítica?
+        if momento_disparo is not None and ahora <= ventana_critica_fin:
+            estaba_en_critica = en_ventana_critica
+            en_ventana_critica = True
+            if not estaba_en_critica:
+                print(f"\n⚡⚡⚡ VENTANA CRÍTICA — refrescando cada {RETRY_INTERVAL_RAPIDO}s ⚡⚡⚡")
+        else:
+            if en_ventana_critica:
+                print(f"\n📉 Saliendo de ventana crítica → polling normal")
+            en_ventana_critica = False
         
-        # Buscar horario disponible
-        print("   🔍 Buscando horarios disponibles...")
-        celda, horario = buscar_horario_disponible(page, config, fecha_objetivo)
+        intervalo = RETRY_INTERVAL_RAPIDO if en_ventana_critica else RETRY_INTERVAL_NORMAL
+        
+        # Loggear con cierta frecuencia (no cada iteración en modo crítico para no spamear)
+        debe_loggear = (
+            not en_ventana_critica or
+            (ahora - ultimo_log).total_seconds() >= 3
+        )
+        
+        if debe_loggear:
+            restante = int((tiempo_maximo - ahora).total_seconds())
+            etiqueta = "⚡" if en_ventana_critica else "🔄"
+            print(f"\n[{ahora.strftime('%H:%M:%S')}] {etiqueta} Intento #{intento} (corta en {restante}s)")
+            ultimo_log = ahora
+        
+        # Buscar horario libre
+        celda, horario = buscar_horario_disponible(page, config, fecha_objetivo, verbose=debe_loggear)
         
         if celda is not None:
-            print(f"   ✅ ¡HORARIO ENCONTRADO! {horario}")
+            print(f"\n🎯 ¡HORARIO DETECTADO! {horario} en intento #{intento} ({ahora.strftime('%H:%M:%S')})")
             if realizar_reserva(page, config, celda, horario, dry_run):
                 return True
             else:
-                print("   ⚠️ Falló la reserva, reintentando...")
+                print("   ⚠️ Falló la reserva (probablemente alguien la tomó), reintentando...")
                 cerrar_modal(page)
-        else:
-            print(f"   ⏳ No hay horarios disponibles aún...")
+                # Después de un fallo, refresco completo
+                refrescar_calendario(page, config)
         
-        # Si ya nos pasamos del corte, salir
         if ahora_ref() >= tiempo_maximo:
             break
         
-        print(f"   ⏰ Esperando {RETRY_INTERVAL_SECONDS}s...")
-        time.sleep(RETRY_INTERVAL_SECONDS)
+        # Esperar y refrescar
+        time.sleep(intervalo)
         
-        print("   🔄 Refrescando calendario...")
-        refrescar_calendario(page, config)
-        navegar_a_dia(page, fecha_objetivo)
+        if en_ventana_critica:
+            refrescar_calendario_rapido(page, config, fecha_objetivo)
+        else:
+            refrescar_calendario(page, config)
+            navegar_a_dia(page, fecha_objetivo)
     
-    print(f"\n❌ TIMEOUT: Se agotó la ventana de intentos ({tiempo_maximo.strftime('%H:%M:%S')})")
+    print(f"\n❌ TIMEOUT: ventana de intentos agotada ({tiempo_maximo.strftime('%H:%M:%S')})")
+    print(f"   Total de intentos: {intento}")
     return False
 
 
@@ -653,7 +727,19 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
 # =============================================================================
 
 def ejecutar_bot(visible=False, dry_run=False):
-    """Función principal del bot."""
+    """
+    Función principal del bot.
+    
+    Modo PROGRAMADO (con ONDEPOR_HORA_OBJETIVO):
+        FASE 1 — Espera inicial: dormir hasta t - PRELOAD_MINUTES_BEFORE
+        FASE 2 — Pre-carga: levantar browser, login, navegar al día.
+                 (si esto termina antes de t-INICIO_BUSQUEDA_SEG_ANTES, esperamos)
+        FASE 3 — Búsqueda: empezar polling rápido a t-INICIO_BUSQUEDA_SEG_ANTES,
+                 hasta encontrar la celda libre o llegar a t+END_MINUTES_AFTER.
+    
+    Modo INMEDIATO (sin hora objetivo):
+        Levanta browser y empieza a buscar inmediatamente.
+    """
     config = get_config()
     fecha_objetivo = get_fecha_objetivo()
     momento_disparo = get_momento_disparo()
@@ -668,18 +754,21 @@ def ejecutar_bot(visible=False, dry_run=False):
     print(f"📆 Día a reservar: {fecha_objetivo.strftime('%A %d/%m/%Y')}")
     print(f"⏰ Horarios preferidos: {config['horarios_preferidos']}")
     print(f"👥 Socios: {', '.join(config['socios'])}")
+    
     if momento_disparo is not None:
-        print(f"🚨 MODO PROGRAMADO: dispara a las {momento_disparo.strftime('%H:%M')} (ARG)")
-        print(f"   → Empieza a intentar a las {(momento_disparo - timedelta(minutes=START_MINUTES_BEFORE)).strftime('%H:%M:%S')}")
-        print(f"   → Corta intentos a las   {(momento_disparo + timedelta(minutes=END_MINUTES_AFTER)).strftime('%H:%M:%S')}")
+        imprimir_plan_programado(momento_disparo)
     else:
         print(f"⚡ MODO INMEDIATO: arranca ya")
+    
     if dry_run:
         print("⚠️  MODO DRY-RUN: No se harán reservas reales")
     print("="*60)
     
-    # FASE 1: ESPERAR (si modo programado)
-    # Hacemos esto ANTES de levantar el browser para no tener Chromium prendido al pedo
+    # =========================================================================
+    # FASE 1 (solo modo programado): ESPERA INICIAL
+    # Dormimos hasta PRELOAD_MINUTES_BEFORE antes de la hora objetivo.
+    # Hacemos esto SIN browser para no consumir RAM/CPU al pedo.
+    # =========================================================================
     if momento_disparo is not None:
         # Validar que no estemos demasiado tarde
         ahora = datetime.now(ARGENTINA_TZ)
@@ -688,9 +777,22 @@ def ejecutar_bot(visible=False, dry_run=False):
             print(f"\n❌ Ya pasó la ventana objetivo (límite {limite.strftime('%H:%M:%S')}). Abortando.")
             sys.exit(1)
         
-        esperar_hasta_momento_objetivo(momento_disparo)
+        momento_preload = momento_disparo - timedelta(minutes=PRELOAD_MINUTES_BEFORE)
+        ahora_naive = ahora.replace(tzinfo=None)
+        preload_naive = momento_preload.replace(tzinfo=None)
+        
+        if ahora_naive < preload_naive:
+            delta = (preload_naive - ahora_naive).total_seconds()
+            print(f"\n💤 FASE 1: Esperando {int(delta)}s ({delta/60:.1f} min) hasta el momento de pre-carga ({momento_preload.strftime('%H:%M:%S')})")
+            print(f"   📌 El runner queda esperando, no apagar.")
+            esperar_hasta(momento_preload, "pre-carga")
+            print(f"\n   ✅ Hora pre-carga alcanzada: {datetime.now(ARGENTINA_TZ).strftime('%H:%M:%S')}")
+        else:
+            print(f"\n⚡ Ya estamos dentro o pasamos el momento de pre-carga, vamos directo")
     
-    # FASE 2: LEVANTAR BROWSER Y EJECUTAR
+    # =========================================================================
+    # FASE 2: LEVANTAR BROWSER + LOGIN + NAVEGACIÓN AL DÍA
+    # =========================================================================
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=not visible,
@@ -706,6 +808,8 @@ def ejecutar_bot(visible=False, dry_run=False):
         page.set_default_timeout(config["timeout_elemento"])
         
         try:
+            print(f"\n📥 FASE 2: Pre-carga (login + navegación)")
+            
             if not login(page, config):
                 print("\n❌ Login fallido. Abortando.")
                 sys.exit(1)
@@ -716,6 +820,30 @@ def ejecutar_bot(visible=False, dry_run=False):
             
             navegar_a_dia(page, fecha_objetivo)
             
+            print(f"\n   ✅ Pre-carga lista a las {datetime.now(ARGENTINA_TZ).strftime('%H:%M:%S')}")
+            
+            # =================================================================
+            # FASE 3a (solo modo programado): ESPERAR hasta t - INICIO_BUSQUEDA_SEG_ANTES
+            # Si la pre-carga terminó muy rápido y estamos lejos de la hora objetivo,
+            # esperamos sin hacer nada para no fatigar al servidor del club.
+            # =================================================================
+            if momento_disparo is not None:
+                momento_busqueda = momento_disparo - timedelta(seconds=INICIO_BUSQUEDA_SEG_ANTES)
+                ahora_naive = datetime.now(ARGENTINA_TZ).replace(tzinfo=None)
+                busqueda_naive = momento_busqueda.replace(tzinfo=None)
+                
+                if ahora_naive < busqueda_naive:
+                    delta = (busqueda_naive - ahora_naive).total_seconds()
+                    print(f"\n⏸️ FASE 3a: Esperando {int(delta)}s hasta empezar a buscar ({momento_busqueda.strftime('%H:%M:%S')})")
+                    esperar_hasta(momento_busqueda, "inicio de búsqueda")
+                    print(f"\n   ✅ Empezando búsqueda agresiva: {datetime.now(ARGENTINA_TZ).strftime('%H:%M:%S')}")
+                else:
+                    print(f"\n⚡ Ya pasamos el momento de inicio de búsqueda, vamos directo")
+            
+            # =================================================================
+            # FASE 3b: BÚSQUEDA AGRESIVA
+            # =================================================================
+            print(f"\n🔍 FASE 3b: Búsqueda y reintentos")
             if intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_disparo, dry_run):
                 print("\n" + "="*60)
                 print("✅ RESERVA COMPLETADA EXITOSAMENTE")
