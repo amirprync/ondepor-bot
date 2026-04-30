@@ -1,7 +1,6 @@
 name: OnDepor - Reserva Pádel
 
 on:
-  # Solo ejecución manual (desde la web o desde la UI de GitHub)
   workflow_dispatch:
     inputs:
       socios:
@@ -14,7 +13,7 @@ on:
         type: string
         default: '10:00,09:00'
       fecha:
-        description: 'Fecha a reservar en formato YYYY-MM-DD (vacío = mañana)'
+        description: 'Fecha del turno a reservar YYYY-MM-DD (vacío = mañana)'
         required: false
         type: string
         default: ''
@@ -26,11 +25,24 @@ on:
           - DIURNO
           - NOCTURNO
         default: DIURNO
+      hora_objetivo:
+        description: 'Hora EXACTA Argentina HH:MM en que se habilita la reserva (vacío = ejecuta ya)'
+        required: false
+        type: string
+        default: ''
+      fecha_objetivo:
+        description: 'Fecha del momento del disparo YYYY-MM-DD (vacío = hoy)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   reservar-cancha:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Máximo 20 minutos de ejecución
+    # IMPORTANTE: timeout alto para soportar la espera del modo programado.
+    # En modo programado, el job puede esperar hasta ~6 horas máximo (límite GH).
+    # Por defecto el job espera + 7 min de ventana de intentos + márgenes.
+    timeout-minutes: 360  # 6 horas (máximo permitido por job en GitHub Actions)
     
     steps:
       - name: Checkout código
@@ -50,10 +62,12 @@ jobs:
       - name: Mostrar parámetros recibidos
         run: |
           echo "🎾 Parámetros de la reserva:"
-          echo "   Socios:    ${{ inputs.socios }}"
-          echo "   Horarios:  ${{ inputs.horarios }}"
-          echo "   Fecha:     ${{ inputs.fecha || 'mañana (default)' }}"
-          echo "   Actividad: ${{ inputs.actividad }}"
+          echo "   Socios:         ${{ inputs.socios }}"
+          echo "   Horarios:       ${{ inputs.horarios }}"
+          echo "   Fecha turno:    ${{ inputs.fecha || 'mañana (default)' }}"
+          echo "   Actividad:      ${{ inputs.actividad }}"
+          echo "   Hora objetivo:  ${{ inputs.hora_objetivo || '(modo inmediato)' }}"
+          echo "   Fecha disparo:  ${{ inputs.fecha_objetivo || 'hoy (default)' }}"
       
       - name: Ejecutar bot de reserva
         env:
@@ -63,6 +77,8 @@ jobs:
           ONDEPOR_HORARIOS: ${{ inputs.horarios }}
           ONDEPOR_FECHA: ${{ inputs.fecha }}
           ONDEPOR_ACTIVIDAD: ${{ inputs.actividad }}
+          ONDEPOR_HORA_OBJETIVO: ${{ inputs.hora_objetivo }}
+          ONDEPOR_FECHA_OBJETIVO: ${{ inputs.fecha_objetivo }}
         run: python ondepor_bot.py
       
       - name: Notificar resultado
