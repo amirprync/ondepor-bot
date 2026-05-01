@@ -81,6 +81,7 @@ VENTANA_CRITICA_DESPUES_SEG = 90    # Cuántos seg después de t seguir con poll
 CALENDAR_XHR_URL = None
 CALENDAR_XHR_HEADERS = None
 CALENDAR_XHR_METHOD = "GET"
+CALENDAR_PAGE_URL = None  # URL de la página del calendario (post click en DIURNO)
 
 # Modo inmediato (sin hora objetivo): ventana max de intentos
 MAX_RETRY_MINUTES_INMEDIATO = 15
@@ -349,6 +350,13 @@ def ir_a_actividad(page, config):
             print(f"❌ No se encontró {actividad}")
             return False
         
+        # Capturar la URL ACTUAL de la página: después de hacer click en DIURNO,
+        # estamos en la página del calendario. Esa URL es la que usaremos para
+        # los refreshes (en vez de page.reload() que vuelve a favoritos).
+        global CALENDAR_PAGE_URL
+        CALENDAR_PAGE_URL = page.url
+        print(f"   📍 URL del calendario: {CALENDAR_PAGE_URL[:100]}", flush=True)
+        
         # Analizar XHRs capturados — buscar el más probable
         if capturadas:
             print(f"   🔍 Detectados {len(capturadas)} XHR(s) del calendario")
@@ -362,9 +370,9 @@ def ir_a_actividad(page, config):
                     print(f"   ✅ XHR refresh: {CALENDAR_XHR_METHOD} {CALENDAR_XHR_URL[:80]}...")
                     break
             if CALENDAR_XHR_URL is None:
-                print(f"   ⚠️ No se identificó XHR del calendario, usaremos reload normal")
+                print(f"   ⚠️ No se identificó XHR del calendario, usaremos goto normal")
         else:
-            print(f"   ⚠️ No se capturaron XHRs, usaremos reload normal")
+            print(f"   ⚠️ No se capturaron XHRs, usaremos goto normal")
         
         return True
         
@@ -522,36 +530,45 @@ def buscar_horario_disponible(page, config, fecha_objetivo, verbose=False):
 
 def refrescar_calendario_rapido(page, config, fecha_objetivo):
     """
-    Refresco AGRESIVO usado en la ventana crítica (cerca de la hora exacta).
+    Refresco AGRESIVO usado en la ventana crítica.
     
     Estrategia:
-    1. Si tenemos URL de XHR del calendario detectada, usar fetch JS para forzar
-       un re-fetch del HTML del grid sin recargar la página entera.
-    2. Si no, hacer reload completo CON networkidle (mejor 1 intento bien hecho
-       que 5 intentos rotos).
+    1. Si tenemos URL del calendario capturada (CALENDAR_PAGE_URL), hacer page.goto()
+       a esa URL directamente. Esto evita el bug de page.reload() que vuelve
+       a la página de favoritos en lugar de mantenerse en el calendario.
+    2. Si no, fallback a reload (probablemente roto, pero peor es nada).
     """
-    global CALENDAR_XHR_URL
+    global CALENDAR_PAGE_URL
     
-    if CALENDAR_XHR_URL:
-        # Estrategia rápida: ejecutar fetch del XHR via JS y re-renderizar.
-        # OnDepor probablemente actualiza el DOM cuando llega la respuesta.
-        # Para simplificar, hacemos reload pero esperando solo el load event.
+    if CALENDAR_PAGE_URL:
         try:
-            page.reload(wait_until="load", timeout=10000)
+            # goto a la URL del calendario directamente. Más rápido que reload
+            # porque no espera networkidle, solo el load básico.
+            page.goto(CALENDAR_PAGE_URL, wait_until="load", timeout=8000)
             return True
         except Exception:
             return False
     
-    # Sin XHR detectado: reload completo con networkidle (lento pero seguro)
+    # Fallback: reload (probablemente no funciona bien)
     try:
-        page.reload(wait_until="networkidle", timeout=10000)
+        page.reload(wait_until="load", timeout=8000)
         return True
     except Exception:
         return False
 
 
 def refrescar_calendario(page, config):
-    """Refresco normal: reload completo con networkidle. Usado fuera de ventana crítica."""
+    """Refresco normal usado fuera de ventana crítica. Usa goto si tenemos URL."""
+    global CALENDAR_PAGE_URL
+    
+    if CALENDAR_PAGE_URL:
+        try:
+            page.goto(CALENDAR_PAGE_URL, wait_until="networkidle", timeout=15000)
+            return True
+        except:
+            return False
+    
+    # Fallback
     try:
         page.reload(wait_until="networkidle", timeout=15000)
         return True
@@ -843,18 +860,25 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
         # Esperar y refrescar
         time.sleep(intervalo)
         
-        # IMPORTANTE: Después de un reload, el calendario YA está en el día correcto.
-        # NO llamamos navegar_a_dia porque (a) es lento y (b) puede romper el estado.
-        # Solo si detectamos que el día ya no está visible, navegamos de nuevo.
+        # Refresh: usa goto a la URL del calendario (NO reload)
         if en_ventana_critica:
             refrescar_calendario_rapido(page, config, fecha_objetivo)
         else:
             refrescar_calendario(page, config)
         
-        # Verificar que sigamos en el día correcto. Si no, intentar navegar.
+        # Verificación post-refresh: ¿el calendario sigue mostrando el día objetivo?
+        # Si por alguna razón se rompió, intentar re-entrar a la actividad completa.
         if not _dia_correcto_visible(page, fecha_objetivo):
-            print("   ↪️ Calendario perdió el día, re-navegando...", flush=True)
-            navegar_a_dia(page, fecha_objetivo)
+            # Solo loggeamos cada 5 intentos para no spamear si está roto
+            if intento % 5 == 0:
+                print(f"   ⚠️ Calendario perdió el día (intento #{intento}), re-entrando a la actividad...", flush=True)
+            # Re-entrar al calendario completo (no solo navegar al día)
+            try:
+                ir_a_actividad(page, config)
+                navegar_a_dia(page, fecha_objetivo)
+            except Exception as e:
+                if intento % 5 == 0:
+                    print(f"   ❌ Error re-entrando: {e}", flush=True)
     
     print(f"\n❌ TIMEOUT: ventana de intentos agotada ({tiempo_maximo.strftime('%H:%M:%S')})", flush=True)
     print(f"   Total de intentos: {intento}", flush=True)
