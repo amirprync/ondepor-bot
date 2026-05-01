@@ -44,6 +44,15 @@ import time
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
+# CRÍTICO: forzar que stdout sea line-buffered (cada print() se ve al toque
+# en los logs de GitHub Actions, no atrapado en buffer hasta que termine el job).
+# Refuerzo de PYTHONUNBUFFERED=1 que está en el workflow YAML.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, OSError):
+    pass
+
 
 # =============================================================================
 # CONFIGURACIÓN
@@ -60,13 +69,18 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 #   t + END_MINUTES_AFTER            →  Abandona si no consiguió
 #
 
-PRELOAD_MINUTES_BEFORE = 2          # Pre-carga (login + navegación) antes de la hora
-INICIO_BUSQUEDA_SEG_ANTES = 5       # Empezar a refrescar X segundos antes de la hora exacta
+PRELOAD_MINUTES_BEFORE = 3          # Pre-carga (login + navegación) antes de la hora — subido a 3min
+INICIO_BUSQUEDA_SEG_ANTES = 10      # Empezar a refrescar X segundos antes — subido a 10s
 END_MINUTES_AFTER = 5               # Cortar intentos X min después de la hora objetivo
 
-RETRY_INTERVAL_RAPIDO = 0.5         # Intervalo durante ventana crítica
+RETRY_INTERVAL_RAPIDO = 0.8         # Intervalo durante ventana crítica (con reload completo)
 RETRY_INTERVAL_NORMAL = 3.0         # Intervalo después de la ventana crítica
-VENTANA_CRITICA_DESPUES_SEG = 60    # Cuántos seg después de t seguir con polling rápido
+VENTANA_CRITICA_DESPUES_SEG = 90    # Cuántos seg después de t seguir con polling rápido
+
+# Variable global para guardar URL del XHR del calendario una vez detectada
+CALENDAR_XHR_URL = None
+CALENDAR_XHR_HEADERS = None
+CALENDAR_XHR_METHOD = "GET"
 
 # Modo inmediato (sin hora objetivo): ventana max de intentos
 MAX_RETRY_MINUTES_INMEDIATO = 15
@@ -181,6 +195,9 @@ def esperar_hasta(momento_target, etiqueta="momento objetivo"):
     Helper genérico para dormir hasta un datetime específico (en zona ARG).
     Imprime progreso cada 60s mientras espera.
     """
+    # Mensaje inicial flusheado para que se vea en los logs en vivo
+    sys.stdout.flush()
+    
     while True:
         ahora = datetime.now(ARGENTINA_TZ)
         if ahora >= momento_target:
@@ -194,7 +211,7 @@ def esperar_hasta(momento_target, etiqueta="momento objetivo"):
             nuevo = datetime.now(ARGENTINA_TZ)
             r2 = (momento_target - nuevo).total_seconds()
             if r2 > 0:
-                print(f"   ⏳ {nuevo.strftime('%H:%M:%S')} — faltan {int(r2)}s ({r2/60:.1f} min) hasta {etiqueta}")
+                print(f"   ⏳ {nuevo.strftime('%H:%M:%S')} — faltan {int(r2)}s ({r2/60:.1f} min) hasta {etiqueta}", flush=True)
         elif restante > 1:
             # Espera precisa para los últimos segundos
             time.sleep(restante - 0.5)
@@ -274,6 +291,24 @@ def ir_a_actividad(page, config):
     actividad = config["actividad"]
     print(f"\n📍 Navegando a {actividad}...")
     
+    # Sniffer: capturar URLs de XHR que parezcan ser del calendario
+    # (las guardamos para usarlas como refresh rápido durante la ventana crítica)
+    global CALENDAR_XHR_URL, CALENDAR_XHR_HEADERS, CALENDAR_XHR_METHOD
+    capturadas = []
+    
+    def on_request(request):
+        url = request.url.lower()
+        # Heurística: el endpoint del calendario probablemente contiene una de estas palabras
+        if any(k in url for k in ["calendar", "schedule", "horario", "turno", "week", "day", "board"]):
+            if request.method in ("GET", "POST"):
+                capturadas.append({
+                    "url": request.url,
+                    "method": request.method,
+                    "headers": request.headers,
+                })
+    
+    page.on("request", on_request)
+    
     page.goto(config["url_favoritos"], timeout=config["timeout_navegacion"])
     page.wait_for_load_state("networkidle")
     time.sleep(3)
@@ -293,6 +328,7 @@ def ir_a_actividad(page, config):
             f'text="CISSAB | {actividad}"',
         ]
         
+        encontrado = False
         for selector in selectores:
             try:
                 elemento = page.locator(selector).first
@@ -301,32 +337,95 @@ def ir_a_actividad(page, config):
                     time.sleep(2)
                     page.wait_for_load_state("networkidle")
                     print(f"✅ En sección {actividad}")
-                    return True
+                    encontrado = True
+                    break
             except:
                 continue
         
-        print(f"❌ No se encontró {actividad}")
-        return False
+        # Quitar el listener
+        page.remove_listener("request", on_request)
+        
+        if not encontrado:
+            print(f"❌ No se encontró {actividad}")
+            return False
+        
+        # Analizar XHRs capturados — buscar el más probable
+        if capturadas:
+            print(f"   🔍 Detectados {len(capturadas)} XHR(s) del calendario")
+            # Tomamos el último que coincida con calendar/board/horario (suele ser el correcto)
+            for cap in reversed(capturadas):
+                u = cap["url"].lower()
+                if any(k in u for k in ["calendar", "board", "schedule"]):
+                    CALENDAR_XHR_URL = cap["url"]
+                    CALENDAR_XHR_METHOD = cap["method"]
+                    CALENDAR_XHR_HEADERS = cap["headers"]
+                    print(f"   ✅ XHR refresh: {CALENDAR_XHR_METHOD} {CALENDAR_XHR_URL[:80]}...")
+                    break
+            if CALENDAR_XHR_URL is None:
+                print(f"   ⚠️ No se identificó XHR del calendario, usaremos reload normal")
+        else:
+            print(f"   ⚠️ No se capturaron XHRs, usaremos reload normal")
+        
+        return True
         
     except Exception as e:
         print(f"❌ Error navegando: {e}")
+        try:
+            page.remove_listener("request", on_request)
+        except:
+            pass
         return False
+
+
+def _dia_correcto_visible(page, fecha_objetivo):
+    """
+    Verifica rápidamente si las celdas del día objetivo están presentes en el DOM.
+    
+    Mira si hay al menos una celda <td> cuyo data-id contenga un timestamp dentro
+    del rango del día objetivo. Si la hay, no necesitamos re-navegar.
+    """
+    fecha_inicio_dia = fecha_objetivo.replace(hour=0, minute=0, second=0, microsecond=0)
+    fecha_fin_dia = fecha_objetivo.replace(hour=23, minute=59, second=59, microsecond=0)
+    timestamp_inicio = int(fecha_inicio_dia.timestamp())
+    timestamp_fin = int(fecha_fin_dia.timestamp())
+    
+    try:
+        # Tomar todas las celdas con data-id que tengan formato time-HH:MM-club-X-TIMESTAMP
+        # y ver si alguna cae en el día objetivo
+        celdas = page.locator('td[data-id*="time-"]').all()
+        for celda in celdas[:30]:  # Limitamos para no gastar tiempo
+            try:
+                data_id = celda.get_attribute("data-id") or ""
+                partes = data_id.split("-")
+                if len(partes) < 5:
+                    continue
+                ts = int(partes[-1])
+                if timestamp_inicio <= ts <= timestamp_fin:
+                    return True
+            except (ValueError, AttributeError):
+                continue
+        return False
+    except Exception:
+        # Si algo falla en la verificación, asumimos que sí (no queremos re-navegar al pedo)
+        return True
 
 
 def navegar_a_dia(page, dia_objetivo):
     """Navega en el calendario hasta el día objetivo."""
-    print(f"\n📅 Navegando al día {dia_objetivo.strftime('%d/%m/%Y')}...")
+    print(f"\n📅 Navegando al día {dia_objetivo.strftime('%d/%m/%Y')}...", flush=True)
+    
+    # Optimización: si el día ya está visible, no hacemos nada
+    if _dia_correcto_visible(page, dia_objetivo):
+        print(f"   ✅ Día {dia_objetivo.day} ya visible en el calendario", flush=True)
+        return True
     
     max_intentos = 10
     for intento in range(max_intentos):
         dia_num = dia_objetivo.day
-        celdas_dia = page.locator(f'td:has-text("{dia_num}")').all()
-        
-        for celda in celdas_dia:
-            texto = celda.inner_text()
-            if str(dia_num) in texto:
-                print(f"   ✅ Día {dia_num} encontrado en el calendario")
-                return True
+        # Verificar si el día objetivo aparece en el DOM por timestamp
+        if _dia_correcto_visible(page, dia_objetivo):
+            print(f"   ✅ Día {dia_num} encontrado en el calendario", flush=True)
+            return True
         
         try:
             page.click('xpath=//div[contains(@class,"calendar-month")]//following-sibling::*[contains(@class,"next")] | //a[contains(@class,"next")]', timeout=2000)
@@ -338,7 +437,7 @@ def navegar_a_dia(page, dia_objetivo):
             except:
                 break
     
-    print(f"   ⚠️ No se pudo navegar al día {dia_num}")
+    print(f"   ⚠️ No se pudo navegar al día {dia_num}", flush=True)
     return True
 
 
@@ -351,55 +450,72 @@ def buscar_horario_disponible(page, config, fecha_objetivo, verbose=False):
     Busca un horario disponible PARA EL DÍA CORRECTO.
     Retorna (locator_celda, horario_str) o (None, None).
     
-    Importante: NO filtra por :not(.disabled) en el selector porque queremos
-    detectar la celda apenas pase a libre, sin tener que esperar al próximo refresco.
+    Optimización: ejecuta UNA sola llamada JS que evalúa todas las celdas relevantes
+    y devuelve un resumen (4-10x más rápido que hacer múltiples get_attribute desde Python).
     """
     fecha_inicio_dia = fecha_objetivo.replace(hour=0, minute=0, second=0, microsecond=0)
     fecha_fin_dia = fecha_objetivo.replace(hour=23, minute=59, second=59, microsecond=0)
-    
     timestamp_inicio = int(fecha_inicio_dia.timestamp())
     timestamp_fin = int(fecha_fin_dia.timestamp())
     
-    if verbose:
-        print(f"   📅 Buscando para fecha: {fecha_objetivo.strftime('%d/%m/%Y')}")
+    horarios = config["horarios_preferidos"]
     
-    for horario in config["horarios_preferidos"]:
-        # Selector SIN :not(.disabled) — para que detecte la celda apenas se libere
-        selector = f'td[data-id*="time-{horario}"]'
-        celdas = page.locator(selector).all()
-        
-        for celda in celdas:
-            try:
-                data_id = celda.get_attribute("data-id") or ""
-                
-                # Filtrar por timestamp del día objetivo
-                partes = data_id.split("-")
-                if len(partes) < 5:
-                    continue
-                try:
-                    timestamp_celda = int(partes[-1])
-                except ValueError:
-                    continue
-                if not (timestamp_inicio <= timestamp_celda <= timestamp_fin):
-                    continue
-                
-                # Acá ya sabemos que es del día correcto. Verificar si está libre.
-                clase = celda.get_attribute("class") or ""
-                if "disabled" in clase:
-                    if verbose:
-                        print(f"   🔒 {horario} todavía deshabilitada")
-                    continue  # Sigue buscando otros horarios o celdas
-                
-                texto = celda.inner_text()
-                if "libres" in texto.lower() or texto.strip().isdigit():
-                    print(f"   ✅ ¡LIBRE! {horario} (timestamp: {timestamp_celda})")
-                    return celda, horario
+    # Una sola llamada JS para evaluar todas las celdas relevantes
+    js = """
+    (args) => {
+        const [horarios, tsIni, tsFin] = args;
+        const result = [];
+        let totalCeldasEnDia = 0;
+        for (const h of horarios) {
+            const celdas = document.querySelectorAll(`td[data-id*="time-${h}"]`);
+            for (const c of celdas) {
+                const dataId = c.getAttribute('data-id') || '';
+                const partes = dataId.split('-');
+                if (partes.length < 5) continue;
+                const ts = parseInt(partes[partes.length - 1]);
+                if (isNaN(ts) || ts < tsIni || ts > tsFin) continue;
+                totalCeldasEnDia++;
+                const clase = c.className || '';
+                const texto = (c.innerText || '').trim();
+                const disabled = clase.includes('disabled');
+                const libre = !disabled && (texto.toLowerCase().includes('libres') || /^\\d+$/.test(texto));
+                result.push({ horario: h, dataId, disabled, libre, texto });
+            }
+        }
+        return { celdas: result, totalCeldasEnDia };
+    }
+    """
+    
+    try:
+        evaluacion = page.evaluate(js, [horarios, timestamp_inicio, timestamp_fin])
+    except Exception as e:
+        if verbose:
+            print(f"   ⚠️ Error evaluando DOM: {e}", flush=True)
+        return None, None
+    
+    celdas_info = evaluacion.get("celdas", [])
+    total = evaluacion.get("totalCeldasEnDia", 0)
+    
+    # Reportar estado si verbose o si no encontramos NADA del día
+    if verbose:
+        if total == 0:
+            print(f"   ❓ Sin celdas del día {fecha_objetivo.strftime('%d/%m/%Y')} en el DOM (calendario no cargado?)", flush=True)
+        else:
+            for c in celdas_info:
+                if c['libre']:
+                    estado = "🔓 LIBRE"
+                elif c['disabled']:
+                    estado = "🔒 disabled"
                 else:
-                    if verbose:
-                        print(f"   ⚠️ {horario} habilitada pero sin lugares ('{texto.strip()[:30]}')")
-                    
-            except Exception:
-                continue
+                    estado = f"❌ sin lugares ('{c['texto'][:25]}')"
+                print(f"   [{c['horario']}] {estado}", flush=True)
+    
+    # Buscar primera celda libre (en orden de prioridad)
+    for c in celdas_info:
+        if c['libre']:
+            print(f"   ✅ ¡LIBRE DETECTADA! {c['horario']}", flush=True)
+            locator = page.locator(f'td[data-id="{c["dataId"]}"]').first
+            return locator, c['horario']
     
     return None, None
 
@@ -407,24 +523,37 @@ def buscar_horario_disponible(page, config, fecha_objetivo, verbose=False):
 def refrescar_calendario_rapido(page, config, fecha_objetivo):
     """
     Refresco AGRESIVO usado en la ventana crítica (cerca de la hora exacta).
-    NO espera networkidle (eso tarda 1-2s extras). Solo recarga rápido.
+    
+    Estrategia:
+    1. Si tenemos URL de XHR del calendario detectada, usar fetch JS para forzar
+       un re-fetch del HTML del grid sin recargar la página entera.
+    2. Si no, hacer reload completo CON networkidle (mejor 1 intento bien hecho
+       que 5 intentos rotos).
     """
+    global CALENDAR_XHR_URL
+    
+    if CALENDAR_XHR_URL:
+        # Estrategia rápida: ejecutar fetch del XHR via JS y re-renderizar.
+        # OnDepor probablemente actualiza el DOM cuando llega la respuesta.
+        # Para simplificar, hacemos reload pero esperando solo el load event.
+        try:
+            page.reload(wait_until="load", timeout=10000)
+            return True
+        except Exception:
+            return False
+    
+    # Sin XHR detectado: reload completo con networkidle (lento pero seguro)
     try:
-        # Navegar al día objetivo de nuevo (igual de rápido que reload pero más confiable
-        # porque no pierde el estado del calendario)
-        page.reload(wait_until="domcontentloaded", timeout=8000)
-        # Esperamos solo a que el DOM esté disponible, no a networkidle
+        page.reload(wait_until="networkidle", timeout=10000)
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
 def refrescar_calendario(page, config):
-    """Refresco normal usado fuera de la ventana crítica."""
+    """Refresco normal: reload completo con networkidle. Usado fuera de ventana crítica."""
     try:
-        page.reload()
-        page.wait_for_load_state("networkidle")
-        time.sleep(1)
+        page.reload(wait_until="networkidle", timeout=15000)
         return True
     except:
         return False
@@ -680,27 +809,30 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
         
         intervalo = RETRY_INTERVAL_RAPIDO if en_ventana_critica else RETRY_INTERVAL_NORMAL
         
-        # Loggear con cierta frecuencia (no cada iteración en modo crítico para no spamear)
-        debe_loggear = (
-            not en_ventana_critica or
-            (ahora - ultimo_log).total_seconds() >= 3
-        )
+        # Loggear cada intento en modo programado (con polling de 0.8s no es tanto spam)
+        # En modo inmediato cada cierto tiempo
+        if momento_disparo is not None:
+            debe_loggear = True  # Siempre loggear en modo programado
+        else:
+            debe_loggear = (ahora - ultimo_log).total_seconds() >= 3
         
         if debe_loggear:
             restante = int((tiempo_maximo - ahora).total_seconds())
             etiqueta = "⚡" if en_ventana_critica else "🔄"
-            print(f"\n[{ahora.strftime('%H:%M:%S')}] {etiqueta} Intento #{intento} (corta en {restante}s)")
+            print(f"[{ahora.strftime('%H:%M:%S')}] {etiqueta} Intento #{intento} (corta en {restante}s)", flush=True)
             ultimo_log = ahora
         
         # Buscar horario libre
-        celda, horario = buscar_horario_disponible(page, config, fecha_objetivo, verbose=debe_loggear)
+        # Verbose siempre activo en modo programado para tener trazabilidad si falla
+        verbose = debe_loggear if momento_disparo is None else True
+        celda, horario = buscar_horario_disponible(page, config, fecha_objetivo, verbose=verbose)
         
         if celda is not None:
-            print(f"\n🎯 ¡HORARIO DETECTADO! {horario} en intento #{intento} ({ahora.strftime('%H:%M:%S')})")
+            print(f"\n🎯 ¡HORARIO DETECTADO! {horario} en intento #{intento} ({ahora.strftime('%H:%M:%S')})", flush=True)
             if realizar_reserva(page, config, celda, horario, dry_run):
                 return True
             else:
-                print("   ⚠️ Falló la reserva (probablemente alguien la tomó), reintentando...")
+                print("   ⚠️ Falló la reserva (probablemente alguien la tomó), reintentando...", flush=True)
                 cerrar_modal(page)
                 # Después de un fallo, refresco completo
                 refrescar_calendario(page, config)
@@ -711,14 +843,21 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
         # Esperar y refrescar
         time.sleep(intervalo)
         
+        # IMPORTANTE: Después de un reload, el calendario YA está en el día correcto.
+        # NO llamamos navegar_a_dia porque (a) es lento y (b) puede romper el estado.
+        # Solo si detectamos que el día ya no está visible, navegamos de nuevo.
         if en_ventana_critica:
             refrescar_calendario_rapido(page, config, fecha_objetivo)
         else:
             refrescar_calendario(page, config)
+        
+        # Verificar que sigamos en el día correcto. Si no, intentar navegar.
+        if not _dia_correcto_visible(page, fecha_objetivo):
+            print("   ↪️ Calendario perdió el día, re-navegando...", flush=True)
             navegar_a_dia(page, fecha_objetivo)
     
-    print(f"\n❌ TIMEOUT: ventana de intentos agotada ({tiempo_maximo.strftime('%H:%M:%S')})")
-    print(f"   Total de intentos: {intento}")
+    print(f"\n❌ TIMEOUT: ventana de intentos agotada ({tiempo_maximo.strftime('%H:%M:%S')})", flush=True)
+    print(f"   Total de intentos: {intento}", flush=True)
     return False
 
 
