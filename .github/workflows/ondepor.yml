@@ -39,10 +39,13 @@ on:
 jobs:
   reservar-cancha:
     runs-on: ubuntu-latest
-    # IMPORTANTE: timeout alto para soportar la espera del modo programado.
-    # En modo programado, el job puede esperar hasta ~6 horas máximo (límite GH).
-    # Por defecto el job espera + 7 min de ventana de intentos + márgenes.
     timeout-minutes: 360  # 6 horas (máximo permitido por job en GitHub Actions)
+    
+    # Forzar Python a no bufferear stdout/stderr.
+    # CRÍTICO: sin esto los print() no aparecen en el log de GitHub Actions
+    # hasta que termina el proceso, y eso impide debuggear en tiempo real.
+    env:
+      PYTHONUNBUFFERED: "1"
     
     steps:
       - name: Checkout código
@@ -79,7 +82,8 @@ jobs:
           ONDEPOR_ACTIVIDAD: ${{ inputs.actividad }}
           ONDEPOR_HORA_OBJETIVO: ${{ inputs.hora_objetivo }}
           ONDEPOR_FECHA_OBJETIVO: ${{ inputs.fecha_objetivo }}
-        run: python ondepor_bot.py
+        # -u: unbuffered output (refuerzo además de PYTHONUNBUFFERED)
+        run: python -u ondepor_bot.py
       
       - name: Notificar resultado
         if: always()
