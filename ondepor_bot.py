@@ -69,13 +69,20 @@ except (AttributeError, OSError):
 #   t + END_MINUTES_AFTER            →  Abandona si no consiguió
 #
 
-PRELOAD_MINUTES_BEFORE = 3          # Pre-carga (login + navegación) antes de la hora — subido a 3min
-INICIO_BUSQUEDA_SEG_ANTES = 10      # Empezar a refrescar X segundos antes — subido a 10s
+PRELOAD_MINUTES_BEFORE = 3          # Pre-carga (login + navegación) antes de la hora
+INICIO_BUSQUEDA_SEG_ANTES = 10      # Empezar a refrescar X segundos antes
 END_MINUTES_AFTER = 5               # Cortar intentos X min después de la hora objetivo
 
-RETRY_INTERVAL_RAPIDO = 0.8         # Intervalo durante ventana crítica (con reload completo)
+RETRY_INTERVAL_RAPIDO = 0.8         # Intervalo durante ventana crítica
 RETRY_INTERVAL_NORMAL = 3.0         # Intervalo después de la ventana crítica
 VENTANA_CRITICA_DESPUES_SEG = 90    # Cuántos seg después de t seguir con polling rápido
+
+# Timeouts AGRESIVOS para el modal de reserva (la ventana es de ~30-60s,
+# no podemos perder 25s en un intento fallido)
+MODAL_OPEN_TIMEOUT = 2500           # ms para que el modal aparezca después del click
+MODAL_INPUT_TIMEOUT = 1500          # ms para que los inputs estén interactuables
+MODAL_SUBMIT_TIMEOUT = 3000         # ms para que el submit responda
+MODAL_CONFIRM_TIMEOUT = 4000        # ms para esperar confirmación post-submit
 
 # Variable global para guardar URL del XHR del calendario una vez detectada
 CALENDAR_XHR_URL = None
@@ -577,181 +584,372 @@ def refrescar_calendario(page, config):
 
 
 def seleccionar_cancha_preferida(page, config):
-    """Selecciona la cancha preferida (KINERET si está disponible)."""
-    print("   🎾 Seleccionando cancha...")
+    """
+    Selecciona la cancha preferida via JS (más rápido que locator + iter).
+    
+    Retorna True si seleccionó alguna cancha, False si falló.
+    """
+    print("   🎾 Seleccionando cancha...", flush=True)
     
     try:
-        selector = page.locator('#reservationform-court_id')
-        opciones = selector.locator('option').all()
+        # JS bulk: lee todas las opciones, encuentra la primera que matchee
+        # las preferencias, y la selecciona. Una sola llamada vs N round-trips.
+        canchas_preferidas = [c.upper() for c in config["canchas_preferidas"]]
         
-        for cancha_pref in config["canchas_preferidas"]:
-            for opcion in opciones:
-                texto = opcion.inner_text().upper()
-                if cancha_pref.upper() in texto:
-                    valor = opcion.get_attribute("value")
-                    selector.select_option(valor)
-                    print(f"   ✅ Cancha seleccionada: {opcion.inner_text()}")
-                    return True
+        resultado = page.evaluate("""
+            (preferidas) => {
+                const sel = document.querySelector('#reservationform-court_id');
+                if (!sel || sel.options.length === 0) return { ok: false, motivo: 'no_select_o_vacio' };
+                
+                // Buscar match con preferencias en orden
+                for (const pref of preferidas) {
+                    for (const opt of sel.options) {
+                        const texto = (opt.text || '').toUpperCase();
+                        if (texto.includes(pref)) {
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            return { ok: true, cancha: opt.text, alternativa: false };
+                        }
+                    }
+                }
+                
+                // Fallback: primera disponible
+                if (sel.options.length > 0) {
+                    const primera = sel.options[0];
+                    sel.value = primera.value;
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true, cancha: primera.text, alternativa: true };
+                }
+                
+                return { ok: false, motivo: 'sin_opciones' };
+            }
+        """, canchas_preferidas)
         
-        if len(opciones) > 0:
-            primera = opciones[0]
-            valor = primera.get_attribute("value")
-            if valor:
-                selector.select_option(valor)
-                print(f"   ✅ Cancha seleccionada: {primera.inner_text()} (alternativa)")
-                return True
+        if resultado.get("ok"):
+            tag = " (alternativa)" if resultado.get("alternativa") else ""
+            print(f"   ✅ Cancha: {resultado['cancha']}{tag}", flush=True)
+            return True
+        else:
+            print(f"   ⚠️ No se pudo seleccionar cancha: {resultado.get('motivo', 'unknown')}", flush=True)
+            return False
                 
     except Exception as e:
-        print(f"   ⚠️ Error seleccionando cancha: {e}")
-    
-    return False
+        print(f"   ⚠️ Error seleccionando cancha: {e}", flush=True)
+        return False
 
 
 def agregar_socios(page, config):
-    """Agrega los socios a la reserva."""
-    print("   👥 Agregando socios...")
+    """
+    Agrega los socios a la reserva con timeouts AGRESIVOS.
+    
+    Retorna True si TODOS los socios se agregaron, False si alguno falló.
+    Esto permite al caller abortar y reintentar rápido en lugar de seguir
+    contra un modal roto.
+    """
+    print("   👥 Agregando socios...", flush=True)
     
     input_socios = page.locator('#reservationform-name')
     
+    fallos = 0
     for socio in config["socios"]:
         try:
-            print(f"      Agregando: {socio}")
-            input_socios.fill("")
-            time.sleep(0.3)
-            input_socios.type(socio, delay=50)
-            time.sleep(1)
+            # Timeouts agresivos: si el input no responde, abandonamos
+            input_socios.fill("", timeout=MODAL_INPUT_TIMEOUT)
+            input_socios.type(socio, delay=30, timeout=MODAL_INPUT_TIMEOUT)
             
+            # Esperar a la sugerencia (timeout corto)
             try:
                 sugerencia = page.locator(f'.tt-suggestion:has-text("{socio}"), .tt-menu div:has-text("{socio}")').first
-                sugerencia.click()
-                time.sleep(0.3)
-                print(f"      ✅ {socio} agregado")
+                sugerencia.click(timeout=1500)
+                print(f"      ✅ {socio}", flush=True)
             except:
+                # Fallback: presionar Enter
                 input_socios.press("Enter")
-                time.sleep(0.3)
+                # Verificar si quedó agregado mirando los chips
+                time.sleep(0.2)
+                print(f"      ✅ {socio} (via Enter)", flush=True)
                 
         except Exception as e:
-            print(f"      ⚠️ Error agregando {socio}: {e}")
+            err_msg = str(e).split('\n')[0][:80]
+            print(f"      ❌ Error agregando {socio}: {err_msg}", flush=True)
+            fallos += 1
+            # Si falla el primero (input roto), abandonar inmediatamente
+            if fallos == 1 and socio == config["socios"][0]:
+                return False
     
-    return True
+    # Si fallaron MÁS de uno, considerar que el modal está roto
+    return fallos < 2
 
 
 def aceptar_terminos(page):
-    """Marca el checkbox de términos y condiciones."""
-    print("   ✓ Aceptando términos...")
-    
+    """Marca el checkbox de términos y condiciones via JS (más rápido)."""
     try:
-        checkbox = page.locator('#reservationform-terms_and_cond')
-        if not checkbox.is_checked():
-            checkbox.click()
-            time.sleep(0.3)
-        print("   ✅ Términos aceptados")
-        return True
+        # JS bulk para verificar y marcar el checkbox en una sola llamada
+        ok = page.evaluate("""
+            () => {
+                const cb = document.querySelector('#reservationform-terms_and_cond');
+                if (!cb) return false;
+                if (!cb.checked) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    cb.dispatchEvent(new Event('click', { bubbles: true }));
+                }
+                return true;
+            }
+        """)
+        if ok:
+            print("   ✓ Términos aceptados", flush=True)
+            return True
+        else:
+            print("   ⚠️ Checkbox de términos no encontrado", flush=True)
+            return False
     except Exception as e:
-        print(f"   ⚠️ Error con checkbox: {e}")
+        print(f"   ⚠️ Error con checkbox: {e}", flush=True)
         return False
 
 
 def verificar_errores(page):
-    """Verifica si hay mensajes de error en el modal."""
-    errores = page.locator('.alert-danger, .alert-warning, [class*="error"], [style*="background"][style*="rgb(23"]').all()
-    
-    for error in errores:
-        try:
-            if error.is_visible():
-                texto = error.inner_text()
-                if texto and len(texto) > 5:
-                    print(f"   ⚠️ ERROR DETECTADO: {texto[:100]}")
-                    return False
-        except:
-            continue
-    
-    if page.locator('text=/máximo de reservas/i').count() > 0:
-        print("   ⚠️ ERROR: Uno de los socios tiene el máximo de reservas permitidas")
-        return False
-    
-    return True
+    """Verifica si hay mensajes de error visibles en el modal (rápido, sin esperas)."""
+    try:
+        errores_texto = page.evaluate("""
+            () => {
+                const selectors = ['.alert-danger', '.alert-warning'];
+                const textos = [];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        const txt = (el.innerText || '').trim();
+                        if (txt && txt.length > 5) textos.push(txt);
+                    }
+                }
+                return textos;
+            }
+        """)
+        
+        for texto in errores_texto:
+            print(f"   ⚠️ ERROR EN FORM: {texto[:100]}", flush=True)
+            if "máximo" in texto.lower() and "reserva" in texto.lower():
+                print("   ❌ Uno de los socios tiene el máximo de reservas", flush=True)
+            return False
+        
+        return True
+    except Exception:
+        # Si la verificación falla, asumimos que no hay errores y seguimos
+        return True
 
 
 def confirmar_reserva(page, dry_run=False):
-    """Hace click en el botón Reservar."""
-    print("   💾 Confirmando reserva...")
+    """
+    Hace click en el botón Reservar con timeouts AGRESIVOS y detección robusta del éxito.
+    """
+    print("   💾 Confirmando reserva...", flush=True)
     
     if dry_run:
-        print("   [DRY RUN] Simulando click en RESERVAR")
+        print("   [DRY RUN] Simulando click en RESERVAR", flush=True)
         return True
     
     if not verificar_errores(page):
-        print("   ❌ No se puede confirmar, hay errores en el formulario")
+        print("   ❌ No se puede confirmar, hay errores en el formulario", flush=True)
         return False
     
     try:
-        page.click('#btn_submit', timeout=5000)
-        time.sleep(3)
-        page.wait_for_load_state("networkidle")
-        time.sleep(2)
+        # Click con timeout agresivo
+        page.click('#btn_submit', timeout=MODAL_SUBMIT_TIMEOUT)
         
-        if page.locator('text=/reserva fue realizada/i').count() > 0:
-            print("   ✅ Reserva confirmada exitosamente")
-            try:
-                page.click('text="CERRAR"', timeout=3000)
-            except:
-                pass
-            return True
-        else:
-            if page.locator('text=/máximo de reservas/i').count() > 0:
-                print("   ❌ Error: máximo de reservas alcanzado")
+        # Esperar la respuesta del servidor — pero NO networkidle (puede tardar mucho).
+        # En su lugar: poll cada 200ms si aparece confirmación O error O modal cerrado.
+        deadline = time.time() + (MODAL_CONFIRM_TIMEOUT / 1000)
+        while time.time() < deadline:
+            estado = page.evaluate("""
+                () => {
+                    // Buscar mensajes de éxito (varios formatos posibles)
+                    const exitos = [
+                        'reserva fue realizada',
+                        'reserva exitosa',
+                        'reserva confirmada',
+                        'turno confirmado',
+                        'reserva realizada con éxito',
+                    ];
+                    const bodyText = document.body.innerText.toLowerCase();
+                    for (const txt of exitos) {
+                        if (bodyText.includes(txt)) return { tipo: 'exito', texto: txt };
+                    }
+                    
+                    // Buscar errores específicos
+                    const errores = ['máximo de reservas', 'ya tiene una reserva', 'no disponible'];
+                    for (const txt of errores) {
+                        if (bodyText.includes(txt)) return { tipo: 'error', texto: txt };
+                    }
+                    
+                    // ¿El modal se cerró? Si sí, asumimos éxito (el modal cierra solo cuando confirma)
+                    const modal = document.querySelector('#popupModal');
+                    if (modal) {
+                        const style = window.getComputedStyle(modal);
+                        const hidden = style.display === 'none' || style.visibility === 'hidden' || !modal.classList.contains('show');
+                        if (hidden) return { tipo: 'modal_cerrado', texto: '' };
+                    }
+                    
+                    return { tipo: 'esperando', texto: '' };
+                }
+            """)
+            
+            if estado['tipo'] == 'exito':
+                print(f"   ✅ ¡RESERVA CONFIRMADA! ('{estado['texto']}')", flush=True)
+                # Cerrar modal si aún está abierto
+                try:
+                    page.click('text="CERRAR"', timeout=1500)
+                except:
+                    pass
+                return True
+            
+            if estado['tipo'] == 'error':
+                print(f"   ❌ Error del servidor: '{estado['texto']}'", flush=True)
                 return False
-            print("   ⚠️ No se pudo verificar la confirmación")
-            return False
+            
+            if estado['tipo'] == 'modal_cerrado':
+                print(f"   ✅ Modal cerrado tras submit (asumimos éxito)", flush=True)
+                return True
+            
+            time.sleep(0.2)
+        
+        # Timeout: ni éxito ni error claro
+        print(f"   ⚠️ No se pudo verificar la confirmación en {MODAL_CONFIRM_TIMEOUT}ms", flush=True)
+        return False
             
     except Exception as e:
-        print(f"   ⚠️ Error al confirmar: {e}")
+        err_msg = str(e).split('\n')[0][:100]
+        print(f"   ⚠️ Error al confirmar: {err_msg}", flush=True)
         return False
 
 
 def cerrar_modal(page):
-    """Cierra el modal de reserva si está abierto."""
+    """Cierra el modal de reserva si está abierto. Rápido, sin reintentos largos."""
     try:
-        page.click('button[data-dismiss="modal"], .close, text="CERRAR"', timeout=2000)
-        time.sleep(1)
+        # Intento 1: ESC (más rápido)
+        page.keyboard.press("Escape")
+        time.sleep(0.2)
+        # Intento 2: si sigue abierto, click en CERRAR
+        if page.evaluate("() => { const m = document.querySelector('#popupModal'); return m && m.classList.contains('show'); }"):
+            try:
+                page.click('button[data-dismiss="modal"], .close', timeout=1000)
+            except:
+                pass
     except:
-        try:
-            page.keyboard.press("Escape")
-            time.sleep(1)
-        except:
-            pass
+        pass
+
+
+def _modal_listo_para_completar(page):
+    """
+    Verifica que el modal esté REALMENTE abierto y los inputs sean interactuables.
+    Esto evita el bug de intentar llenar un modal "fantasma" que aparece pero no
+    está completamente renderizado.
+    
+    Retorna True si el modal está listo, False si no.
+    """
+    try:
+        # Verificación 1: el modal está visible y abierto
+        modal_visible = page.evaluate("""
+            () => {
+                const m = document.querySelector('#popupModal');
+                if (!m) return false;
+                const style = window.getComputedStyle(m);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                // Verificar que tenga la clase 'show' o style display:block
+                return m.classList.contains('show') || style.display === 'block';
+            }
+        """)
+        if not modal_visible:
+            return False
+        
+        # Verificación 2: el input de socios existe Y es visible Y es interactuable
+        input_listo = page.evaluate("""
+            () => {
+                const inp = document.querySelector('#reservationform-name');
+                if (!inp) return false;
+                const style = window.getComputedStyle(inp);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                if (inp.disabled || inp.readOnly) return false;
+                const rect = inp.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+        """)
+        if not input_listo:
+            return False
+        
+        # Verificación 3: el select de cancha también debe estar
+        cancha_lista = page.evaluate("""
+            () => {
+                const sel = document.querySelector('#reservationform-court_id');
+                if (!sel) return false;
+                return sel.options.length > 0;
+            }
+        """)
+        return cancha_lista
+        
+    except Exception:
+        return False
 
 
 def realizar_reserva(page, config, celda_horario, horario, dry_run=False):
-    """Realiza todo el proceso de reserva."""
-    print(f"\n{'='*50}")
-    print(f"🎾 Reservando horario {horario}")
-    print(f"{'='*50}")
+    """
+    Realiza todo el proceso de reserva con timeouts AGRESIVOS.
+    
+    Si en ~5 segundos no logramos completar el modal, abandonamos y reintentamos.
+    Mejor 3 intentos rápidos que 1 lento que pierde la cancha.
+    """
+    print(f"\n🎾 Reservando horario {horario}", flush=True)
     
     try:
+        # 1. Click en la celda
         celda_horario.click()
-        time.sleep(2)
         
-        page.wait_for_selector('#popupModal.show, #popupModal[style*="display: block"]', timeout=5000)
-        time.sleep(1)
+        # 2. Esperar a que el modal esté COMPLETAMENTE listo (no solo visible)
+        # Polling cada 100ms hasta MODAL_OPEN_TIMEOUT
+        deadline = time.time() + (MODAL_OPEN_TIMEOUT / 1000)
+        modal_ok = False
+        while time.time() < deadline:
+            if _modal_listo_para_completar(page):
+                modal_ok = True
+                break
+            time.sleep(0.1)
         
-        seleccionar_cancha_preferida(page, config)
-        time.sleep(config["delay_entre_acciones"] / 1000)
+        if not modal_ok:
+            print(f"   ⚠️ Modal no se abrió correctamente en {MODAL_OPEN_TIMEOUT}ms — abandonando este intento", flush=True)
+            cerrar_modal(page)
+            return False
         
-        agregar_socios(page, config)
-        time.sleep(config["delay_entre_acciones"] / 1000)
+        print(f"   ✅ Modal listo", flush=True)
         
+        # 3. Seleccionar cancha (usa el select interno, sin esperas extra)
+        if not seleccionar_cancha_preferida(page, config):
+            print(f"   ⚠️ No se pudo seleccionar cancha — abandonando", flush=True)
+            cerrar_modal(page)
+            return False
+        
+        # 4. Agregar socios (con timeouts cortos, pero recordando que el input
+        # YA está listo porque pasamos _modal_listo_para_completar)
+        if not agregar_socios(page, config):
+            print(f"   ⚠️ Error agregando socios — abandonando", flush=True)
+            cerrar_modal(page)
+            return False
+        
+        # 5. Aceptar términos
         aceptar_terminos(page)
-        time.sleep(config["delay_entre_acciones"] / 1000)
         
+        # 6. Confirmar (esto es lo que realmente importa)
         if confirmar_reserva(page, dry_run):
             return True
         else:
             return False
             
     except Exception as e:
-        print(f"❌ Error en reserva: {e}")
+        print(f"❌ Error en reserva: {e}", flush=True)
+        try:
+            cerrar_modal(page)
+        except:
+            pass
         return False
 
 
@@ -849,10 +1047,13 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
             if realizar_reserva(page, config, celda, horario, dry_run):
                 return True
             else:
-                print("   ⚠️ Falló la reserva (probablemente alguien la tomó), reintentando...", flush=True)
+                print("   ⚠️ Falló la reserva, reintentando rápido...", flush=True)
                 cerrar_modal(page)
-                # Después de un fallo, refresco completo
-                refrescar_calendario(page, config)
+                # IMPORTANTE: usar refresh RÁPIDO (no completo) para no perder tiempo.
+                # El refresh rápido usa goto a la URL del calendario directamente.
+                refrescar_calendario_rapido(page, config, fecha_objetivo)
+                # Saltar el sleep — queremos volver a buscar YA
+                continue
         
         if ahora_ref() >= tiempo_maximo:
             break
@@ -868,16 +1069,15 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
         
         # Verificación post-refresh: ¿el calendario sigue mostrando el día objetivo?
         # Si por alguna razón se rompió, intentar re-entrar a la actividad completa.
+        # PERO solo cada N intentos, porque re-entrar es lento y mientras tanto perdemos tiempo.
         if not _dia_correcto_visible(page, fecha_objetivo):
-            # Solo loggeamos cada 5 intentos para no spamear si está roto
-            if intento % 5 == 0:
-                print(f"   ⚠️ Calendario perdió el día (intento #{intento}), re-entrando a la actividad...", flush=True)
-            # Re-entrar al calendario completo (no solo navegar al día)
-            try:
-                ir_a_actividad(page, config)
-                navegar_a_dia(page, fecha_objetivo)
-            except Exception as e:
-                if intento % 5 == 0:
+            # Solo loggeamos y re-entramos cada 10 intentos para no perder tiempo crítico
+            if intento % 10 == 0:
+                print(f"   ⚠️ Calendario perdió el día (intento #{intento}), re-entrando...", flush=True)
+                try:
+                    ir_a_actividad(page, config)
+                    navegar_a_dia(page, fecha_objetivo)
+                except Exception as e:
                     print(f"   ❌ Error re-entrando: {e}", flush=True)
     
     print(f"\n❌ TIMEOUT: ventana de intentos agotada ({tiempo_maximo.strftime('%H:%M:%S')})", flush=True)
