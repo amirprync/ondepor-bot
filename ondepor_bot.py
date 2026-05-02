@@ -63,6 +63,11 @@ MAX_RETRY_MINUTES_INMEDIATO = 15
 # Argentina: UTC-3 fijo (no usa horario de verano desde 2009)
 ARGENTINA_TZ = timezone(timedelta(hours=-3))
 
+# URL de la página del calendario (capturada después de hacer click en DIURNO/NOCTURNO).
+# Se usa para refrescar con goto() en vez de reload(), ya que reload() te tira
+# de vuelta a la página de favoritos.
+CALENDAR_PAGE_URL = None
+
 
 # =============================================================================
 # CONFIGURACIÓN DEL BOT
@@ -250,6 +255,11 @@ def ir_a_actividad(page, config):
                     time.sleep(2)
                     page.wait_for_load_state("networkidle")
                     print(f"✅ En sección {actividad}")
+                    # Capturar la URL del calendario para usar con goto() en los refreshes.
+                    # reload() vuelve a favoritos y rompe el calendario.
+                    global CALENDAR_PAGE_URL
+                    CALENDAR_PAGE_URL = page.url
+                    print(f"   📍 URL del calendario: {CALENDAR_PAGE_URL[:100]}")
                     return True
             except:
                 continue
@@ -260,6 +270,34 @@ def ir_a_actividad(page, config):
     except Exception as e:
         print(f"❌ Error navegando: {e}")
         return False
+
+
+def _dia_visible_en_calendario(page, fecha_objetivo):
+    """
+    Verifica rápidamente si las celdas del día objetivo están en el DOM.
+    Mira los timestamps en data-id, no busca por número de día (eso era ambiguo).
+    """
+    fecha_inicio = fecha_objetivo.replace(hour=0, minute=0, second=0, microsecond=0)
+    fecha_fin = fecha_objetivo.replace(hour=23, minute=59, second=59, microsecond=0)
+    ts_ini = int(fecha_inicio.timestamp())
+    ts_fin = int(fecha_fin.timestamp())
+    
+    try:
+        celdas = page.locator('td[data-id*="time-"]').all()
+        for celda in celdas[:30]:
+            try:
+                data_id = celda.get_attribute("data-id") or ""
+                partes = data_id.split("-")
+                if len(partes) < 5:
+                    continue
+                ts = int(partes[-1])
+                if ts_ini <= ts <= ts_fin:
+                    return True
+            except (ValueError, AttributeError):
+                continue
+        return False
+    except Exception:
+        return True  # Si falla, asumimos OK (no queremos re-navegar al pedo)
 
 
 def navegar_a_dia(page, dia_objetivo):
@@ -342,10 +380,21 @@ def buscar_horario_disponible(page, config, fecha_objetivo):
 
 
 def refrescar_calendario(page, config):
-    """Refresca el calendario para ver nuevos horarios disponibles."""
+    """
+    Refresca el calendario para ver nuevos horarios disponibles.
+    
+    IMPORTANTE: usa goto() a la URL del calendario en vez de reload().
+    El reload() en OnDepor te tira de vuelta a la página de favoritos,
+    rompiendo el calendario.
+    """
+    global CALENDAR_PAGE_URL
     try:
-        page.reload()
-        page.wait_for_load_state("networkidle")
+        if CALENDAR_PAGE_URL:
+            page.goto(CALENDAR_PAGE_URL, wait_until="networkidle", timeout=15000)
+        else:
+            # Fallback al reload tradicional si no capturamos URL (no debería pasar)
+            page.reload()
+            page.wait_for_load_state("networkidle")
         time.sleep(1)
         return True
     except:
@@ -606,8 +655,11 @@ def intentar_reserva_con_reintentos(page, config, fecha_objetivo, momento_dispar
         print("   🔄 Refrescando calendario...")
         refrescar_calendario(page, config)
 
-        # Re-navegar al día (necesario después del reload)
-        navegar_a_dia(page, fecha_objetivo)
+        # NO llamamos navegar_a_dia acá: con goto() a la URL del calendario,
+        # el día ya viene cargado. Solo navegamos si por alguna razón el día
+        # no está visible (chequeo rápido).
+        if not _dia_visible_en_calendario(page, fecha_objetivo):
+            navegar_a_dia(page, fecha_objetivo)
 
     print(f"\n❌ TIMEOUT: ventana de intentos agotada ({tiempo_maximo.strftime('%H:%M:%S')})")
     return False
