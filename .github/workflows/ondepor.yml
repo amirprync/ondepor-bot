@@ -39,29 +39,27 @@ on:
 jobs:
   reservar-cancha:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 horas (máximo permitido por job en GitHub Actions)
-    
-    # Forzar Python a no bufferear stdout/stderr.
-    # CRÍTICO: sin esto los print() no aparecen en el log de GitHub Actions
-    # hasta que termina el proceso, y eso impide debuggear en tiempo real.
+    timeout-minutes: 360  # 6 horas (máximo permitido por job)
+
+    # Forzar Python a no bufferear stdout — los print() aparecen en vivo en GitHub Actions
     env:
       PYTHONUNBUFFERED: "1"
-    
+
     steps:
       - name: Checkout código
         uses: actions/checkout@v4
-      
+
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Instalar dependencias
         run: |
           pip install playwright
           playwright install chromium
           playwright install-deps
-      
+
       - name: Mostrar parámetros recibidos
         run: |
           echo "🎾 Parámetros de la reserva:"
@@ -71,7 +69,7 @@ jobs:
           echo "   Actividad:      ${{ inputs.actividad }}"
           echo "   Hora objetivo:  ${{ inputs.hora_objetivo || '(modo inmediato)' }}"
           echo "   Fecha disparo:  ${{ inputs.fecha_objetivo || 'hoy (default)' }}"
-      
+
       - name: Ejecutar bot de reserva
         env:
           ONDEPOR_USER: ${{ secrets.ONDEPOR_USER }}
@@ -82,9 +80,8 @@ jobs:
           ONDEPOR_ACTIVIDAD: ${{ inputs.actividad }}
           ONDEPOR_HORA_OBJETIVO: ${{ inputs.hora_objetivo }}
           ONDEPOR_FECHA_OBJETIVO: ${{ inputs.fecha_objetivo }}
-        # -u: unbuffered output (refuerzo además de PYTHONUNBUFFERED)
         run: python -u ondepor_bot.py
-      
+
       - name: Notificar resultado
         if: always()
         run: |
